@@ -56,7 +56,7 @@ Use ClipForge only for content you own or are authorized to download. Respect co
 
 ## Distribution
 
-Linux packaging options and their current tradeoffs are documented in [DISTRIBUTION.md](DISTRIBUTION.md). No AppImage, Flatpak, or native package is release-ready yet.
+A tagged release publishes a Linux x86_64 binary, so running ClipForge does not require Rust. `yt-dlp`, FFmpeg, and a preview player remain separate installs. Details and the formats still under evaluation are in [DISTRIBUTION.md](DISTRIBUTION.md).
 
 ## Contributing
 

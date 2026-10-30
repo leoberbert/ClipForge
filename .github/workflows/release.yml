@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches the crate version
+        run: |
+          crate_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$crate_version" = "$tag_version"
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="clipforge-${version}-linux-x86_64"
+          mkdir "$name"
+          cp target/release/clipforge "$name/clipforge"
+          cp packaging/linux-readme.txt "$name/README.txt"
+          tar -czf "${name}.tar.gz" "$name"
+          echo "asset=${name}.tar.gz" >> "$GITHUB_ENV"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.asset }}
+          body_path: packaging/release-notes.md
+          fail_on_unmatched_files: true
+          generate_release_notes: true

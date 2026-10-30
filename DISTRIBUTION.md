@@ -1,6 +1,8 @@
 # Linux distribution notes
 
-ClipForge currently builds from source with Cargo. yt-dlp and FFmpeg are external runtime dependencies; do not bundle them until license obligations, updates, and security provenance are defined.
+People can run ClipForge from a GitHub release without installing Rust. Pushing a tag `vX.Y.Z` that matches `version` in `Cargo.toml` builds `clipforge` on Ubuntu 24.04 and attaches `clipforge-X.Y.Z-linux-x86_64.tar.gz` to the release. The binary links against glibc, so it expects Ubuntu 24.04 or a newer distribution such as current Fedora.
+
+yt-dlp and FFmpeg stay external runtime dependencies. Do not bundle them until license obligations, updates, and security provenance are defined. A preview still needs VLC, MPV, or FFplay.
 
 ## Formats under evaluation
 
@@ -8,4 +10,4 @@ ClipForge currently builds from source with Cargo. yt-dlp and FFmpeg are externa
 - **AppImage:** convenient single-file delivery, but multimedia libraries and platform integration increase bundle size and maintenance. Validate on multiple distributions before release.
 - **Native packages:** best fit for using distribution-maintained yt-dlp/FFmpeg and graphics libraries; requires per-distribution packaging and release automation.
 
-No package format is release-ready. The application must first complete media-operation validation and expose clear dependency diagnostics.
+Flatpak, AppImage, and per-distribution packages are not release-ready. A Windows binary is not published either: the save dialog, opening an export, history paths, and preview volume still use Linux tools.
