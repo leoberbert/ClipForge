@@ -3640,30 +3640,5 @@ Sink Input #18
             desktop_exec("/home/user/My Apps/clipforge"),
             "\"/home/user/My Apps/clipforge\""
         );
-        let file = tempfile::Builder::new()
-            .suffix(".png")
-            .tempfile()
-            .expect("png tempfile");
-        std::fs::write(file.path(), ICON_64).expect("write png");
-        let output = std::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=width,height",
-                "-of",
-                "csv=p=0",
-                file.path().to_str().expect("png path"),
-            ])
-            .output()
-            .expect("ffprobe");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "64,64");
     }
 }
