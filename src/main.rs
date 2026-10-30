@@ -34,9 +34,12 @@ const INK: Color = Color::from_rgb8(0x1A, 0x14, 0x0C);
 const SUCCESS: Color = Color::from_rgb8(0x8F, 0xBF, 0x9F);
 const DANGER: Color = Color::from_rgb8(0xE7, 0xB2, 0xA8);
 const TRACK: Color = Color::from_rgb8(0x2C, 0x2E, 0x36);
+#[cfg(any(target_os = "linux", test))]
 const APP_ID: &str = "clipforge";
+#[cfg(target_os = "linux")]
 const ICON_48: &[u8] = include_bytes!("../assets/icons/clipforge-48.png");
 const ICON_64: &[u8] = include_bytes!("../assets/icons/clipforge-64.png");
+#[cfg(target_os = "linux")]
 const ICON_128: &[u8] = include_bytes!("../assets/icons/clipforge-128.png");
 const ICON_256: &[u8] = include_bytes!("../assets/icons/clipforge-256.png");
 
@@ -187,6 +190,7 @@ fn write_if_changed(path: &std::path::Path, bytes: &[u8]) -> Option<bool> {
     Some(true)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn desktop_entry(executable: &str, icon: &str) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=ClipForge\nComment=Download an authorized video interval\nExec={}\nIcon={icon}\nStartupWMClass={APP_ID}\nTerminal=false\nCategories=AudioVideo;\n",
@@ -194,6 +198,7 @@ fn desktop_entry(executable: &str, icon: &str) -> String {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn desktop_exec(executable: &str) -> String {
     if executable.contains([' ', '\t', '"', '\\']) {
         format!(
@@ -255,6 +260,7 @@ struct App {
     page: Page,
     thumbnail_pending: bool,
     thumbnail_generation: u64,
+    toolchain: Toolchain,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Language {
@@ -426,6 +432,9 @@ enum Message {
     ThumbnailLoaded(u64, Result<Vec<u8>, String>),
     LanguageChanged(Language),
     ProgressTick,
+    RecheckTools,
+    OpenToolPage(ToolPage),
+    OpenToolsFolder,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviewPlayer {
@@ -569,23 +578,30 @@ impl App {
                     }
                 }
             }
-            Message::Load => match validate_video_url(&self.url) {
-                Ok(url) => {
-                    self.loading = true;
-                    self.notice = Some(
-                        if self.language == Language::Portuguese {
-                            "Carregando metadados do vídeo…"
-                        } else {
-                            "Loading video metadata…"
+            Message::Load => {
+                self.toolchain = Toolchain::probe();
+                if self.toolchain.ytdlp.is_none() {
+                    self.notice = export_blocker(&self.toolchain, self.language);
+                } else {
+                    match validate_video_url(&self.url) {
+                        Ok(url) => {
+                            self.loading = true;
+                            self.notice = Some(
+                                if self.language == Language::Portuguese {
+                                    "Carregando metadados do vídeo…"
+                                } else {
+                                    "Loading video metadata…"
+                                }
+                                .into(),
+                            );
+                            return iced::Task::perform(fetch_metadata(url), Message::Loaded);
                         }
-                        .into(),
-                    );
-                    return iced::Task::perform(fetch_metadata(url), Message::Loaded);
+                        Err(error) => {
+                            self.notice = Some(localized_error(&error.to_string(), self.language))
+                        }
+                    }
                 }
-                Err(error) => {
-                    self.notice = Some(localized_error(&error.to_string(), self.language))
-                }
-            },
+            }
             Message::Loaded(result) => {
                 self.loading = false;
                 match result {
@@ -620,14 +636,10 @@ impl App {
                             });
                         }
                     }
-                    Err(_error) => self.notice = Some(
-                        if self.language == Language::Portuguese {
-                            "Falha ao carregar metadados. Verifique a URL, o yt-dlp e sua conexão."
-                        } else {
-                            "Metadata lookup failed. Check the URL, yt-dlp, and network connection."
-                        }
-                        .into(),
-                    ),
+                    Err(error) => {
+                        self.toolchain = Toolchain::probe();
+                        self.notice = Some(metadata_notice(&error, self.language));
+                    }
                 }
             }
             Message::Export => {
@@ -635,7 +647,10 @@ impl App {
                     "UI event received: export (video loaded: {})",
                     self.video.is_some()
                 );
-                if let Some(video) = self.video.clone() {
+                self.toolchain = Toolchain::probe();
+                if let Some(notice) = export_blocker(&self.toolchain, self.language) {
+                    self.notice = Some(notice);
+                } else if let Some(video) = self.video.clone() {
                     let parsed = parse_range(&self.start, &self.end, video.duration);
                     match parsed {
                         Ok((start, end)) => {
@@ -871,6 +886,16 @@ impl App {
                 }
             }
             Message::SelectPage(page) => self.page = page,
+            Message::RecheckTools => {
+                self.toolchain = Toolchain::probe();
+                self.notice = Some(toolchain_summary(&self.toolchain, self.language));
+            }
+            Message::OpenToolPage(page) => {
+                return iced::Task::perform(open_web_page(page.url()), Message::Opened);
+            }
+            Message::OpenToolsFolder => {
+                return iced::Task::perform(open_tools_folder(), Message::Opened);
+            }
         }
         iced::Task::none()
     }
@@ -967,6 +992,8 @@ impl App {
             (self.t("Exporting", "Exportando"), ACCENT)
         } else if self.previewing || self.preview_active {
             (self.t("Preview", "Pré-visualização"), ACCENT)
+        } else if !self.toolchain.ready() {
+            (self.t("Setup", "Instalação"), DANGER)
         } else {
             (self.t("Ready", "Pronto"), SUCCESS)
         };
@@ -1057,6 +1084,11 @@ impl App {
 
     fn create_page(&self) -> Element<'_, Message> {
         let mut page = column![].spacing(16).width(Fill);
+        if !self.toolchain.ready() {
+            page = page.push(self.setup_card());
+        } else if self.toolchain.deno.is_none() {
+            page = page.push(self.deno_note());
+        }
         if self.video.is_none() {
             page = page.push(self.hero());
         }
@@ -1089,6 +1121,127 @@ impl App {
         ]
         .spacing(8)
         .into()
+    }
+
+    fn setup_card(&self) -> Element<'_, Message> {
+        let ytdlp = dependency_line(
+            "yt-dlp",
+            self.t(
+                "Reads the video and downloads the selected section.",
+                "Lê o vídeo e baixa só o trecho.",
+            ),
+            self.presence_label(self.toolchain.ytdlp.is_some()),
+            if self.toolchain.ytdlp.is_some() {
+                SUCCESS
+            } else {
+                DANGER
+            },
+        );
+        let ffmpeg = dependency_line(
+            "FFmpeg",
+            self.t(
+                "Cuts the section and writes the file.",
+                "Corta o trecho e grava o arquivo.",
+            ),
+            self.presence_label(self.toolchain.ffmpeg.is_some()),
+            if self.toolchain.ffmpeg.is_some() {
+                SUCCESS
+            } else {
+                DANGER
+            },
+        );
+        let deno_present = self.toolchain.deno.is_some();
+        let deno = dependency_line(
+            "Deno",
+            self.t(
+                "Recommended for current YouTube extraction.",
+                "Recomendado para a extração atual do YouTube.",
+            ),
+            self.presence_label(deno_present),
+            if deno_present { SUCCESS } else { ACCENT },
+        );
+        card(
+            column![
+                text(self.t("Install the media tools", "Instale as ferramentas de mídia"))
+                    .size(16)
+                    .color(TEXT),
+                text(self.t(
+                    "ClipForge does not ship yt-dlp or FFmpeg. yt-dlp needs frequent updates, and FFmpeg has its own license. Install the official builds and ClipForge will use them.",
+                    "O ClipForge não inclui o yt-dlp nem o FFmpeg. O yt-dlp precisa de atualizações frequentes, e o FFmpeg tem licença própria. Instale as versões oficiais e o ClipForge passa a usá-las.",
+                ))
+                .size(13)
+                .color(MUTED),
+                ytdlp,
+                ffmpeg,
+                deno,
+                container(text(install_instructions(self.language)).size(13).color(TEXT))
+                    .width(Fill)
+                    .padding(14)
+                    .style(|_theme| inset_style()),
+                text(tools_drop_hint(self.language)).size(13).color(MUTED),
+                row![
+                    button(text(self.t("Check again", "Verificar de novo")).size(14))
+                        .on_press(Message::RecheckTools)
+                        .padding([11, 16])
+                        .style(primary_button),
+                    button(text(self.t("Open tools folder", "Abrir pasta tools")).size(14))
+                        .on_press(Message::OpenToolsFolder)
+                        .padding([11, 16])
+                        .style(secondary_button),
+                    button(text(self.t("yt-dlp site", "Site do yt-dlp")).size(14))
+                        .on_press(Message::OpenToolPage(ToolPage::YtDlp))
+                        .padding([11, 16])
+                        .style(secondary_button),
+                    button(text(self.t("FFmpeg site", "Site do FFmpeg")).size(14))
+                        .on_press(Message::OpenToolPage(ToolPage::Ffmpeg))
+                        .padding([11, 16])
+                        .style(secondary_button),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14),
+        )
+    }
+
+    fn deno_note(&self) -> Element<'_, Message> {
+        container(
+            row![
+                column![
+                    text(self.t(
+                        "Deno was not found. YouTube may fail or expose fewer formats.",
+                        "O Deno não foi encontrado. O YouTube pode falhar ou mostrar menos formatos.",
+                    ))
+                    .size(13)
+                    .color(TEXT),
+                    text(deno_install_hint(self.language)).size(12).color(MUTED),
+                ]
+                .spacing(4)
+                .width(Fill),
+                button(text(self.t("Check again", "Verificar de novo")).size(13))
+                    .on_press(Message::RecheckTools)
+                    .padding([8, 12])
+                    .style(secondary_button),
+                button(text(self.t("Deno site", "Site do Deno")).size(13))
+                    .on_press(Message::OpenToolPage(ToolPage::Deno))
+                    .padding([8, 12])
+                    .style(secondary_button),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .padding([12, 16])
+        .style(|_theme| inset_style())
+        .into()
+    }
+
+    fn presence_label(&self, present: bool) -> &'static str {
+        if present {
+            self.t("found", "encontrado")
+        } else {
+            self.t("missing", "ausente")
+        }
     }
 
     fn step_row(&self) -> Element<'_, Message> {
@@ -1446,12 +1599,12 @@ impl App {
     }
 
     fn preview_volume_hint(&self) -> &'static str {
-        if command_exists("vlc") {
+        if self.toolchain.vlc.is_some() {
             self.t(
                 "The volume slider is on the bottom bar of the player window.",
                 "O volume fica na barra inferior da janela do reprodutor.",
             )
-        } else if command_exists("mpv") {
+        } else if self.toolchain.mpv.is_some() {
             self.t(
                 "Move the pointer over the video to show the volume control.",
                 "Passe o mouse sobre o vídeo para mostrar o volume.",
@@ -1810,27 +1963,377 @@ async fn choose_destination(filename: String) -> Result<Option<String>, String> 
     ))
 }
 
+#[derive(Clone, Debug)]
+struct Toolchain {
+    ytdlp: Option<PathBuf>,
+    ffmpeg: Option<PathBuf>,
+    deno: Option<PathBuf>,
+    vlc: Option<PathBuf>,
+    mpv: Option<PathBuf>,
+}
+
+impl Default for Toolchain {
+    fn default() -> Self {
+        Self::probe()
+    }
+}
+
+impl Toolchain {
+    fn probe() -> Self {
+        Self {
+            ytdlp: resolve_executable("yt-dlp"),
+            ffmpeg: resolve_executable("ffmpeg"),
+            deno: resolve_executable("deno"),
+            vlc: resolve_executable("vlc"),
+            mpv: resolve_executable("mpv"),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.ytdlp.is_some() && self.ffmpeg.is_some()
+    }
+
+    fn missing_required(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.ytdlp.is_none() {
+            missing.push("yt-dlp");
+        }
+        if self.ffmpeg.is_none() {
+            missing.push("FFmpeg");
+        }
+        missing
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ToolPage {
+    YtDlp,
+    Ffmpeg,
+    Deno,
+}
+
+impl ToolPage {
+    fn url(self) -> &'static str {
+        match self {
+            Self::YtDlp => "https://github.com/yt-dlp/yt-dlp#installation",
+            Self::Ffmpeg => "https://ffmpeg.org/download.html",
+            Self::Deno => "https://docs.deno.com/runtime/getting_started/installation/",
+        }
+    }
+}
+
 fn command_exists(name: &str) -> bool {
+    resolve_executable(name).is_some()
+}
+
+fn resolve_executable(name: &str) -> Option<PathBuf> {
+    find_named_tool(&tool_search_dirs(), name)
+}
+
+fn find_named_tool(directories: &[PathBuf], name: &str) -> Option<PathBuf> {
     let names = executable_names(name);
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths)
-            .any(|directory| names.iter().any(|file| directory.join(file).is_file()))
+    directories.iter().find_map(|directory| {
+        names.iter().find_map(|file| {
+            let candidate = directory.join(file);
+            candidate.is_file().then_some(candidate)
+        })
     })
+}
+
+fn tool_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = app_directory() {
+        push_unique_dir(&mut dirs, dir.join("tools"));
+        push_unique_dir(&mut dirs, dir);
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        let parent = parent.to_path_buf();
+        push_unique_dir(&mut dirs, parent.join("tools"));
+        push_unique_dir(&mut dirs, parent);
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+        push_unique_dir(
+            &mut dirs,
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links"),
+        );
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            push_unique_dir(&mut dirs, directory);
+        }
+    }
+    dirs
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+fn app_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = std::env::var_os("APPIMAGE").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(appimage);
+        if path.is_file()
+            && let Some(parent) = path.parent()
+        {
+            return Some(parent.to_path_buf());
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+}
+
+fn tools_directory() -> Option<PathBuf> {
+    app_directory().map(|dir| dir.join("tools"))
 }
 
 fn executable_names(name: &str) -> Vec<String> {
     #[cfg(windows)]
     {
-        let mut names = vec![name.to_owned()];
+        let mut names = Vec::new();
         if !name.to_ascii_lowercase().ends_with(".exe") {
             names.push(format!("{name}.exe"));
         }
+        names.push(name.to_owned());
         names
     }
     #[cfg(not(windows))]
     {
         vec![name.to_owned()]
     }
+}
+
+fn require_executable(name: &str) -> Result<PathBuf, String> {
+    resolve_executable(name).ok_or_else(|| missing_tool_error(name))
+}
+
+fn missing_tool_error(name: &str) -> String {
+    match name {
+        "yt-dlp" => AppError::MissingYtdlp.to_string(),
+        "ffmpeg" => "FFmpeg is not installed. Install FFmpeg and retry.".into(),
+        "ffplay" | "mpv" | "vlc" => {
+            "Install VLC, MPV, or FFplay to preview the selected interval.".into()
+        }
+        other => format!("{other} is not installed."),
+    }
+}
+
+fn prepare_media_command(program: PathBuf) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    if let Ok(path) = std::env::join_paths(tool_search_dirs()) {
+        command.env("PATH", path);
+    }
+    command
+}
+
+fn media_tool(name: &str) -> Result<tokio::process::Command, String> {
+    Ok(prepare_media_command(require_executable(name)?))
+}
+
+fn export_blocker(toolchain: &Toolchain, language: Language) -> Option<String> {
+    let missing = toolchain.missing_required();
+    if missing.is_empty() {
+        return None;
+    }
+    let names = missing.join(", ");
+    Some(match language {
+        Language::Portuguese => format!(
+            "Falta instalar: {names}. Siga as instruções acima e clique em Verificar de novo."
+        ),
+        Language::English => {
+            format!("Still missing: {names}. Follow the instructions above and choose Check again.")
+        }
+    })
+}
+
+fn toolchain_summary(toolchain: &Toolchain, language: Language) -> String {
+    let missing = toolchain.missing_required();
+    if missing.is_empty() {
+        return match (language, toolchain.deno.is_some()) {
+            (Language::Portuguese, true) => "yt-dlp, FFmpeg e Deno encontrados.".into(),
+            (Language::Portuguese, false) => {
+                "yt-dlp e FFmpeg encontrados. O Deno continua recomendado para o YouTube.".into()
+            }
+            (Language::English, true) => "yt-dlp, FFmpeg, and Deno were found.".into(),
+            (Language::English, false) => {
+                "yt-dlp and FFmpeg were found. Deno is still recommended for YouTube.".into()
+            }
+        };
+    }
+    let names = missing.join(", ");
+    match language {
+        Language::Portuguese => format!("Ainda falta: {names}."),
+        Language::English => format!("Still missing: {names}."),
+    }
+}
+
+fn install_instructions(language: Language) -> String {
+    #[cfg(windows)]
+    {
+        match language {
+            Language::Portuguese => "\
+No Terminal do Windows:
+
+winget install yt-dlp.yt-dlp
+winget install Gyan.FFmpeg
+winget install DenoLand.Deno
+
+Feche e abra o ClipForge. Um programa que já está aberto não enxerga o PATH novo."
+                .into(),
+            Language::English => "\
+In Windows Terminal:
+
+winget install yt-dlp.yt-dlp
+winget install Gyan.FFmpeg
+winget install DenoLand.Deno
+
+Quit and reopen ClipForge. A program that is already open does not see the new PATH."
+                .into(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let packages = linux_install_command();
+        match language {
+            Language::Portuguese => format!(
+                "No terminal:\n\n{packages}\n\nO Deno é opcional e recomendado para o YouTube. Use a página oficial se a distribuição não tiver o pacote."
+            ),
+            Language::English => format!(
+                "In a terminal:\n\n{packages}\n\nDeno is optional and recommended for YouTube. Use the official page if your distribution has no package."
+            ),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn linux_install_command() -> &'static str {
+    if resolve_executable("dnf").is_some() {
+        "sudo dnf install yt-dlp ffmpeg"
+    } else if resolve_executable("apt").is_some() {
+        "sudo apt install yt-dlp ffmpeg"
+    } else if resolve_executable("pacman").is_some() {
+        "sudo pacman -S yt-dlp ffmpeg"
+    } else if resolve_executable("zypper").is_some() {
+        "sudo zypper install yt-dlp ffmpeg"
+    } else {
+        "sudo <package manager> install yt-dlp ffmpeg"
+    }
+}
+
+fn deno_install_hint(language: Language) -> String {
+    #[cfg(windows)]
+    {
+        let _language = language;
+        "winget install DenoLand.Deno".into()
+    }
+    #[cfg(not(windows))]
+    {
+        match language {
+            Language::Portuguese => {
+                "Instale o pacote deno da distribuição, ou use a página oficial.".into()
+            }
+            Language::English => {
+                "Install the distribution deno package, or use the official page.".into()
+            }
+        }
+    }
+}
+
+fn tools_drop_hint(language: Language) -> String {
+    let folder = tools_directory()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "tools".into());
+    #[cfg(windows)]
+    let files_pt = "yt-dlp.exe, ffmpeg.exe e ffplay.exe";
+    #[cfg(windows)]
+    let files_en = "yt-dlp.exe, ffmpeg.exe, and ffplay.exe";
+    #[cfg(not(windows))]
+    let files_pt = "yt-dlp, ffmpeg e ffplay";
+    #[cfg(not(windows))]
+    let files_en = "yt-dlp, ffmpeg, and ffplay";
+    match language {
+        Language::Portuguese => {
+            format!("Ou coloque {files_pt} nesta pasta e clique em Verificar de novo:\n{folder}")
+        }
+        Language::English => {
+            format!("Or place {files_en} in this folder and choose Check again:\n{folder}")
+        }
+    }
+}
+
+fn dependency_line<'a>(
+    name: &'a str,
+    role: &'a str,
+    state: &'a str,
+    state_color: Color,
+) -> Element<'a, Message> {
+    column![
+        row![
+            text(name).size(14).color(TEXT),
+            text(state).size(13).color(state_color),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        text(role).size(12).color(MUTED),
+    ]
+    .spacing(2)
+    .into()
+}
+
+fn metadata_notice(error: &str, language: Language) -> String {
+    if error == AppError::MissingYtdlp.to_string()
+        || error == "FFmpeg is not installed. Install FFmpeg and retry."
+    {
+        return localized_error(error, language);
+    }
+    let detail = summarize_external_error(error);
+    match language {
+        Language::Portuguese => format!("Falha ao carregar metadados. {detail}"),
+        Language::English => format!("Metadata lookup failed. {detail}"),
+    }
+}
+
+fn summarize_external_error(error: &str) -> String {
+    let line = error
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty() && !line.starts_with("WARNING:"))
+        .unwrap_or("Check the URL and your connection.");
+    let mut summary: String = line.chars().take(220).collect();
+    if line.chars().count() > 220 {
+        summary.push('…');
+    }
+    summary
+}
+
+async fn open_web_page(url: &'static str) -> Result<(), String> {
+    open_command(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open the installation page: {error}"))
+}
+
+async fn open_tools_folder() -> Result<(), String> {
+    let Some(dir) = tools_directory() else {
+        return Err("Could not locate the tools folder.".into());
+    };
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| format!("Could not create the tools folder: {error}"))?;
+    let path = dir.to_string_lossy().into_owned();
+    open_command(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open the tools folder: {error}"))
 }
 
 fn history_file() -> Option<PathBuf> {
@@ -2008,6 +2511,9 @@ fn localized_error(error: &str, language: Language) -> String {
         }
         "yt-dlp is not installed. Install yt-dlp and retry." => {
             "O yt-dlp não está instalado. Instale-o e tente novamente.".into()
+        }
+        "FFmpeg is not installed. Install FFmpeg and retry." => {
+            "O FFmpeg não está instalado. Instale-o e tente novamente.".into()
         }
         "Invalid clip range: use HH:MM:SS and ensure start < end ≤ video duration." => {
             "Intervalo inválido: use HH:MM:SS e verifique início < fim ≤ duração do vídeo.".into()
@@ -2362,7 +2868,7 @@ fn parse_range(start: &str, end: &str, duration: u64) -> Result<(u64, u64), AppE
     }
 }
 async fn fetch_metadata(url: String) -> Result<VideoInfo, String> {
-    let output = tokio::process::Command::new("yt-dlp")
+    let output = media_tool("yt-dlp")?
         .args([
             "--no-warnings",
             "--dump-single-json",
@@ -2500,7 +3006,7 @@ async fn launch_preview(
         }
     }
     if command_exists("mpv") {
-        let mut player = tokio::process::Command::new("mpv")
+        let mut player = media_tool("mpv")?
             .args([
                 "--force-window=yes".to_owned(),
                 "--osc=yes".to_owned(),
@@ -2626,7 +3132,7 @@ async fn spawn_detached_player(
     label: &str,
     failure: &'static str,
 ) -> Result<PreviewPlayer, String> {
-    let mut child = tokio::process::Command::new(program)
+    let mut child = media_tool(program)?
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2719,7 +3225,7 @@ fn synced_preview_args(video: &str, audio: &str, start: u64, end: u64) -> Vec<St
 }
 
 async fn preview_stream_urls(url: &str) -> Result<Vec<String>, String> {
-    let output = tokio::process::Command::new("yt-dlp")
+    let output = media_tool("yt-dlp")?
         .args([
             "--ignore-config",
             "--no-warnings",
@@ -2761,7 +3267,7 @@ async fn spawn_ffplay(
     end: u64,
     progress: Arc<PreviewProgress>,
 ) -> Result<PreviewPlayer, String> {
-    let mut player = tokio::process::Command::new("ffplay")
+    let mut player = media_tool("ffplay")?
         .args(ffplay_preview_args(url, start, end))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2803,7 +3309,7 @@ async fn spawn_synced_preview(
     end: u64,
     progress: Arc<PreviewProgress>,
 ) -> Result<PreviewPlayer, String> {
-    let mut transcoder = tokio::process::Command::new("ffmpeg")
+    let mut transcoder = media_tool("ffmpeg")?
         .args(synced_preview_args(video, audio, start, end))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2815,7 +3321,7 @@ async fn spawn_synced_preview(
         .stdout
         .take()
         .ok_or_else(|| "FFmpeg preview output was unavailable.".to_owned())?;
-    let mut player = match tokio::process::Command::new("ffplay")
+    let mut player = match media_tool("ffplay")?
         .args([
             "-hide_banner",
             "-autoexit",
@@ -2989,7 +3495,9 @@ async fn export(
         selected_format.as_deref(),
         &template,
     );
-    let mut command = tokio::process::Command::new("yt-dlp");
+    let program = require_executable("yt-dlp")?;
+    require_executable("ffmpeg")?;
+    let mut command = prepare_media_command(program);
     command
         .args(args)
         .stdout(Stdio::null())
@@ -3693,6 +4201,51 @@ Sink Input #18
             slave.last().map(String::as_str),
             Some("https://example.test/v")
         );
+    }
+
+    #[test]
+    fn reports_missing_required_tools_and_keeps_external_errors_short() {
+        let missing = Toolchain {
+            ytdlp: None,
+            ffmpeg: None,
+            deno: None,
+            vlc: None,
+            mpv: None,
+        };
+        assert!(!missing.ready());
+        assert_eq!(missing.missing_required(), ["yt-dlp", "FFmpeg"]);
+        assert!(
+            export_blocker(&missing, Language::Portuguese)
+                .unwrap()
+                .contains("yt-dlp")
+        );
+        let ready = Toolchain {
+            ytdlp: Some(PathBuf::from("yt-dlp")),
+            ffmpeg: Some(PathBuf::from("ffmpeg")),
+            deno: None,
+            ..missing
+        };
+        assert!(ready.ready());
+        assert!(export_blocker(&ready, Language::English).is_none());
+        assert_eq!(
+            summarize_external_error("WARNING: old\nERROR: Sign in to confirm you're not a bot"),
+            "ERROR: Sign in to confirm you're not a bot"
+        );
+        assert!(summarize_external_error(&"x".repeat(300)).chars().count() <= 221);
+        assert!(
+            metadata_notice("ERROR: Video unavailable", Language::Portuguese)
+                .starts_with("Falha ao carregar metadados.")
+        );
+    }
+
+    #[test]
+    fn finds_an_executable_placed_in_a_tools_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = executable_names("yt-dlp").remove(0);
+        std::fs::write(dir.path().join(&file_name), b"tool").unwrap();
+        let found = find_named_tool(&[dir.path().to_path_buf()], "yt-dlp").unwrap();
+        assert_eq!(found, dir.path().join(file_name));
+        assert!(find_named_tool(&[dir.path().to_path_buf()], "ffmpeg").is_none());
     }
 
     #[test]
