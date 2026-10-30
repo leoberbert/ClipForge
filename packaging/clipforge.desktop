@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ClipForge
+Comment=Download an authorized video interval
+Exec=clipforge
+Icon=clipforge
+StartupWMClass=clipforge
+Terminal=false
+Categories=AudioVideo;

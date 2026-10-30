@@ -1,7 +1,13 @@
 ## Linux
 
-Download `clipforge-<version>-linux-x86_64.tar.gz`, extract it, and run `./clipforge`. Rust is not required.
+Download `clipforge-<version>-linux-x86_64.AppImage`, mark it executable, and run it. Rust is not required.
 
-The binary needs glibc from Ubuntu 24.04 or newer, which current Fedora releases also provide. Install `yt-dlp`, FFmpeg, and VLC, MPV, or FFplay from the distribution. Deno is recommended for current YouTube extraction. yt-dlp and FFmpeg are not bundled.
+The AppImage needs glibc from Ubuntu 24.04 or newer. Current Fedora releases qualify. If it does not start, run it with `--appimage-extract-and-run`.
 
-A Windows build is not part of this release.
+## Windows
+
+Download `clipforge-<version>-windows-x86_64.zip`, extract it, and run `clipforge.exe`. Rust is not required.
+
+## Both
+
+Install `yt-dlp`, FFmpeg, and VLC, MPV, or FFplay, and keep them on `PATH`. Deno is recommended for current YouTube extraction. yt-dlp and FFmpeg are not bundled.

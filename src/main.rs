@@ -46,6 +46,7 @@ fn main() -> iced::Result {
             .default_filter_or("warn,wgpu_hal=error,wgpu_core=error,naga=error"),
     )
     .init();
+    #[cfg(target_os = "linux")]
     install_desktop_integration();
     iced::application(App::new, App::update, App::view)
         .title("ClipForge")
@@ -121,6 +122,7 @@ fn decode_icon(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     Some((info.width, info.height, pixels))
 }
 
+#[cfg(target_os = "linux")]
 fn install_desktop_integration() {
     let Some(data_home) = xdg_data_home() else {
         return;
@@ -147,9 +149,14 @@ fn install_desktop_integration() {
     let desktop_path = data_home
         .join("applications")
         .join(format!("{APP_ID}.desktop"));
-    let executable = std::env::current_exe()
+    let executable = std::env::var("APPIMAGE")
         .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
+        .filter(|value| !value.is_empty() && !value.contains(['\n', '\r']))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.into_os_string().into_string().ok())
+        })
         .unwrap_or_else(|| APP_ID.to_owned());
     let icon = icon_path.to_string_lossy().replace(['\n', '\r'], "");
     let Some(desktop_changed) =
@@ -162,6 +169,7 @@ fn install_desktop_integration() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn xdg_data_home() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
@@ -169,6 +177,7 @@ fn xdg_data_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
 }
 
+#[cfg(target_os = "linux")]
 fn write_if_changed(path: &std::path::Path, bytes: &[u8]) -> Option<bool> {
     if std::fs::read(path).ok().as_deref() == Some(bytes) {
         return Some(false);
@@ -196,6 +205,7 @@ fn desktop_exec(executable: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn refresh_desktop_cache(data_home: &std::path::Path) {
     let _ = std::process::Command::new("update-desktop-database")
         .arg(data_home.join("applications"))
@@ -1801,18 +1811,59 @@ async fn choose_destination(filename: String) -> Result<Option<String>, String> 
 }
 
 fn command_exists(name: &str) -> bool {
+    let names = executable_names(name);
     std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
+        std::env::split_paths(&paths)
+            .any(|directory| names.iter().any(|file| directory.join(file).is_file()))
     })
 }
 
+fn executable_names(name: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let mut names = vec![name.to_owned()];
+        if !name.to_ascii_lowercase().ends_with(".exe") {
+            names.push(format!("{name}.exe"));
+        }
+        names
+    }
+    #[cfg(not(windows))]
+    {
+        vec![name.to_owned()]
+    }
+}
+
 fn history_file() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
+    Some(state_dir()?.join("history.json"))
+}
+
+fn state_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| user_home().map(|home| home.join("AppData").join("Local")))
+            .map(|base| base.join("clipforge"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| user_home().map(|home| home.join(".local/state")))
+            .map(|base| base.join("clipforge"))
+    }
+}
+
+fn user_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let key = "USERPROFILE";
+    #[cfg(not(windows))]
+    let key = "HOME";
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
-    Some(base.join("clipforge/history.json"))
 }
 
 fn load_history() -> Vec<String> {
@@ -1870,11 +1921,25 @@ fn save_language(language: Language) {
 }
 
 async fn open_export(path: String) -> Result<(), String> {
-    tokio::process::Command::new("xdg-open")
-        .arg(path)
+    open_command(&path)
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("Could not open export: {error}"))
+}
+
+fn open_command(path: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "start", "", path]);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = tokio::process::Command::new("xdg-open");
+        command.arg(path);
+        command
+    }
 }
 #[derive(Debug, Clone)]
 struct VideoInfo {
@@ -2158,7 +2223,7 @@ fn safe_file_stem(title: &str) -> String {
 }
 fn default_destination(title: &str) -> PathBuf {
     let filename = format!("{}.mp4", safe_file_stem(title));
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    if let Some(home) = user_home()
         && home.is_absolute()
     {
         return default_destination_in(&home, &filename);

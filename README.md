@@ -56,7 +56,7 @@ Use ClipForge only for content you own or are authorized to download. Respect co
 
 ## Distribution
 
-A tagged release publishes a Linux x86_64 binary, so running ClipForge does not require Rust. `yt-dlp`, FFmpeg, and a preview player remain separate installs. Details and the formats still under evaluation are in [DISTRIBUTION.md](DISTRIBUTION.md).
+The Release workflow in Actions publishes a Linux AppImage and a Windows zip, so running ClipForge does not require Rust. `yt-dlp`, FFmpeg, and a preview player remain separate installs. Details are in [DISTRIBUTION.md](DISTRIBUTION.md).
 
 ## Contributing
 
