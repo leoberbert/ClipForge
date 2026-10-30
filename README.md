@@ -1,6 +1,18 @@
 # ClipForge
 
+<p align="center">
+  <img src="assets/icons/clipforge-256.png" width="128" alt="Ícone do ClipForge">
+</p>
+
 ClipForge is an open-source Linux desktop application for selecting and exporting video clips. The project is in active early development.
+
+<p align="center">
+  <img src="assets/readme/workspace.png" alt="Área de trabalho do ClipForge, pronta para carregar um vídeo">
+</p>
+
+<p align="center">
+  <img src="assets/readme/selection.png" alt="Seleção do intervalo, da qualidade e do formato de saída">
+</p>
 
 ## Status
 
