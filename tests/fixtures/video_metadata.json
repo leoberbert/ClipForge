@@ -1,0 +1,10 @@
+{
+  "title": "Sample authorized clip",
+  "channel": "Example Creator",
+  "duration": 3723.5,
+  "thumbnail": "https://i.ytimg.com/vi/example/hqdefault.jpg",
+  "formats": [
+    {"format_id": "18", "height": 360, "ext": "mp4"},
+    {"format_id": "137", "height": 1080, "ext": "mp4"}
+  ]
+}
