@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use iced::widget::image::Handle;
 use iced::widget::{
     button, canvas, column, container, pick_list, progress_bar, row, rule, scrollable, slider,
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::watch;
 use url::Url;
 
@@ -42,6 +44,7 @@ const ICON_64: &[u8] = include_bytes!("../assets/icons/clipforge-64.png");
 #[cfg(target_os = "linux")]
 const ICON_128: &[u8] = include_bytes!("../assets/icons/clipforge-128.png");
 const ICON_256: &[u8] = include_bytes!("../assets/icons/clipforge-256.png");
+const PREVIEW_WINDOW_TITLE: &str = "ClipForge preview";
 
 fn main() -> iced::Result {
     env_logger::Builder::from_env(
@@ -261,6 +264,8 @@ struct App {
     thumbnail_pending: bool,
     thumbnail_generation: u64,
     toolchain: Toolchain,
+    installing_tools: bool,
+    install_progress: Option<Arc<InstallProgress>>,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Language {
@@ -388,6 +393,62 @@ impl PreviewProgress {
         PreviewStage::from_u8(self.stage.load(Ordering::Relaxed))
     }
 }
+
+#[derive(Default)]
+struct InstallProgress {
+    current: AtomicU8,
+    total: AtomicU8,
+    label: Mutex<String>,
+}
+
+impl InstallProgress {
+    fn new(total: u8) -> Self {
+        Self {
+            current: AtomicU8::new(0),
+            total: AtomicU8::new(total.max(1)),
+            label: Mutex::new(String::new()),
+        }
+    }
+
+    fn set_waiting(&self, language: Language) {
+        self.current.store(0, Ordering::Relaxed);
+        if let Ok(mut label) = self.label.lock() {
+            *label = match language {
+                Language::Portuguese => "Preparando a instalação com o winget…".into(),
+                Language::English => "Preparing the winget install…".into(),
+            };
+        }
+    }
+
+    fn set_package(&self, index: u8, package: &str, language: Language) {
+        self.current.store(index, Ordering::Relaxed);
+        if let Ok(mut label) = self.label.lock() {
+            *label = match language {
+                Language::Portuguese => format!("Instalando {package}…"),
+                Language::English => format!("Installing {package}…"),
+            };
+        }
+    }
+
+    fn summary(&self, language: Language) -> String {
+        let current = self.current.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed).max(1);
+        let detail = self
+            .label
+            .lock()
+            .ok()
+            .map(|label| label.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| match language {
+                Language::Portuguese => "Instalando…".into(),
+                Language::English => "Installing…".into(),
+            });
+        match language {
+            Language::Portuguese => format!("{detail}  ({current}/{total})"),
+            Language::English => format!("{detail}  ({current}/{total})"),
+        }
+    }
+}
 impl App {
     fn new() -> Self {
         Self {
@@ -434,7 +495,9 @@ enum Message {
     ProgressTick,
     RecheckTools,
     OpenToolPage(ToolPage),
-    OpenToolsFolder,
+    CopyInstallCommands,
+    InstallMissingTools,
+    ToolsInstalled(Result<String, String>),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreviewPlayer {
@@ -759,9 +822,9 @@ impl App {
                             self.preview_player = None;
                             self.notice = Some(
                                 if self.language == Language::Portuguese {
-                                    "Aguarde. A pré-visualização está sendo preparada e abrirá em outra janela."
+                                    "Aguarde. Baixando só o trecho selecionado para a pré-visualização…"
                                 } else {
-                                    "Please wait. The preview is being prepared and will open in another window."
+                                    "Please wait. Downloading only the selected range for preview…"
                                 }
                                 .into(),
                             );
@@ -786,7 +849,7 @@ impl App {
                         self.preview_active = true;
                         self.preview_player = Some(player);
                         self.notice = Some(preview_opened_notice(player, self.language));
-                        if player == PreviewPlayer::Ffplay {
+                        if player == PreviewPlayer::Ffplay && in_app_preview_volume_supported() {
                             let volume = self.preview_volume;
                             return iced::Task::perform(
                                 set_preview_volume(volume),
@@ -884,17 +947,57 @@ impl App {
                     self.preview_active = false;
                     self.preview_player = None;
                 }
+                if self.installing_tools
+                    && let Some(progress) = &self.install_progress
+                {
+                    self.notice = Some(progress.summary(self.language));
+                }
             }
             Message::SelectPage(page) => self.page = page,
             Message::RecheckTools => {
+                refresh_process_path();
                 self.toolchain = Toolchain::probe();
                 self.notice = Some(toolchain_summary(&self.toolchain, self.language));
             }
             Message::OpenToolPage(page) => {
                 return iced::Task::perform(open_web_page(page.url()), Message::Opened);
             }
-            Message::OpenToolsFolder => {
-                return iced::Task::perform(open_tools_folder(), Message::Opened);
+            Message::CopyInstallCommands => {
+                let commands = install_commands_text(self.language);
+                self.notice = Some(
+                    self.t(
+                        "Install commands copied.",
+                        "Comandos de instalação copiados.",
+                    )
+                    .into(),
+                );
+                return iced::clipboard::write(commands);
+            }
+            Message::InstallMissingTools => {
+                if self.installing_tools {
+                    return iced::Task::none();
+                }
+                let packages = self.toolchain.packages_to_install();
+                let progress = Arc::new(InstallProgress::new(packages.len() as u8));
+                progress.set_waiting(self.language);
+                self.install_progress = Some(progress.clone());
+                self.installing_tools = true;
+                self.notice = Some(progress.summary(self.language));
+                let toolchain = self.toolchain.clone();
+                let language = self.language;
+                return iced::Task::perform(
+                    install_missing_tools(toolchain, language, progress),
+                    Message::ToolsInstalled,
+                );
+            }
+            Message::ToolsInstalled(result) => {
+                self.installing_tools = false;
+                self.install_progress = None;
+                refresh_process_path();
+                self.toolchain = Toolchain::probe();
+                self.notice = Some(match result {
+                    Ok(message) | Err(message) => message,
+                });
             }
         }
         iced::Task::none()
@@ -988,6 +1091,8 @@ impl App {
     fn workspace(&self) -> Element<'_, Message> {
         let (status, status_color) = if self.loading {
             (self.t("Loading", "Carregando"), ACCENT)
+        } else if self.installing_tools {
+            (self.t("Installing", "Instalando"), ACCENT)
         } else if self.exporting {
             (self.t("Exporting", "Exportando"), ACCENT)
         } else if self.previewing || self.preview_active {
@@ -1027,7 +1132,10 @@ impl App {
         if let Some(notice) = self.notice_banner() {
             workspace = workspace.push(notice);
         }
-        if self.preview_active && self.preview_player == Some(PreviewPlayer::Ffplay) {
+        if self.preview_active
+            && self.preview_player == Some(PreviewPlayer::Ffplay)
+            && in_app_preview_volume_supported()
+        {
             workspace = workspace.push(self.volume_controls());
         }
         let body = match self.page {
@@ -1086,8 +1194,13 @@ impl App {
         let mut page = column![].spacing(16).width(Fill);
         if !self.toolchain.ready() {
             page = page.push(self.setup_card());
-        } else if self.toolchain.deno.is_none() {
-            page = page.push(self.deno_note());
+        } else {
+            if self.toolchain.deno.is_none() {
+                page = page.push(self.deno_note());
+            }
+            if !self.toolchain.has_preview_player() {
+                page = page.push(self.preview_player_note());
+            }
         }
         if self.video.is_none() {
             page = page.push(self.hero());
@@ -1160,78 +1273,249 @@ impl App {
             self.presence_label(deno_present),
             if deno_present { SUCCESS } else { ACCENT },
         );
+        let preview_present = self.toolchain.has_preview_player();
+        let preview = dependency_line(
+            "VLC",
+            self.t(
+                "Recommended preview player with pause, seek, and volume.",
+                "Reprodutor recomendado para prévia, com pause, seek e volume.",
+            ),
+            if preview_present {
+                self.t("found", "encontrado")
+            } else {
+                self.t("missing", "ausente")
+            },
+            if preview_present { SUCCESS } else { ACCENT },
+        );
+        let mut actions = row![].spacing(10).align_y(Alignment::Center);
+        if can_auto_install() && self.toolchain.has_installable_gap() {
+            actions = actions.push(
+                button(
+                    text(if self.installing_tools {
+                        self.t("Installing…", "Instalando…")
+                    } else {
+                        self.t("Install missing tools", "Instalar o que falta")
+                    })
+                    .size(14),
+                )
+                .on_press_maybe((!self.installing_tools).then_some(Message::InstallMissingTools))
+                .padding([11, 16])
+                .style(if self.installing_tools {
+                    busy_button
+                } else {
+                    primary_button
+                }),
+            );
+        }
+        actions = actions.push(
+            button(text(self.t("Copy commands", "Copiar comandos")).size(14))
+                .on_press(Message::CopyInstallCommands)
+                .padding([11, 16])
+                .style(secondary_button),
+        );
+        actions = actions.push(
+            button(text(self.t("Check again", "Verificar de novo")).size(14))
+                .on_press_maybe((!self.installing_tools).then_some(Message::RecheckTools))
+                .padding([11, 16])
+                .style(secondary_button),
+        );
         card(
             column![
                 text(self.t("Install the media tools", "Instale as ferramentas de mídia"))
                     .size(16)
                     .color(TEXT),
                 text(self.t(
-                    "ClipForge does not ship yt-dlp or FFmpeg. yt-dlp needs frequent updates, and FFmpeg has its own license. Install the official builds and ClipForge will use them.",
-                    "O ClipForge não inclui o yt-dlp nem o FFmpeg. O yt-dlp precisa de atualizações frequentes, e o FFmpeg tem licença própria. Instale as versões oficiais e o ClipForge passa a usá-las.",
+                    "ClipForge does not ship yt-dlp or FFmpeg. Accept the install below to use the official builds, or copy the commands and run them yourself.",
+                    "O ClipForge não inclui o yt-dlp nem o FFmpeg. Aceite a instalação abaixo para usar as versões oficiais, ou copie os comandos e rode você mesmo.",
                 ))
                 .size(13)
                 .color(MUTED),
                 ytdlp,
                 ffmpeg,
                 deno,
+                preview,
+                self.install_progress_panel(),
                 container(text(install_instructions(self.language)).size(13).color(TEXT))
                     .width(Fill)
                     .padding(14)
                     .style(|_theme| inset_style()),
-                text(tools_drop_hint(self.language)).size(13).color(MUTED),
+                actions,
                 row![
-                    button(text(self.t("Check again", "Verificar de novo")).size(14))
-                        .on_press(Message::RecheckTools)
-                        .padding([11, 16])
-                        .style(primary_button),
-                    button(text(self.t("Open tools folder", "Abrir pasta tools")).size(14))
-                        .on_press(Message::OpenToolsFolder)
-                        .padding([11, 16])
-                        .style(secondary_button),
-                    button(text(self.t("yt-dlp site", "Site do yt-dlp")).size(14))
+                    button(text(self.t("yt-dlp site", "Site do yt-dlp")).size(13))
                         .on_press(Message::OpenToolPage(ToolPage::YtDlp))
-                        .padding([11, 16])
-                        .style(secondary_button),
-                    button(text(self.t("FFmpeg site", "Site do FFmpeg")).size(14))
+                        .padding([8, 12])
+                        .style(quiet_button),
+                    button(text(self.t("FFmpeg site", "Site do FFmpeg")).size(13))
                         .on_press(Message::OpenToolPage(ToolPage::Ffmpeg))
-                        .padding([11, 16])
-                        .style(secondary_button),
+                        .padding([8, 12])
+                        .style(quiet_button),
+                    button(text(self.t("Deno site", "Site do Deno")).size(13))
+                        .on_press(Message::OpenToolPage(ToolPage::Deno))
+                        .padding([8, 12])
+                        .style(quiet_button),
+                    button(text(self.t("VLC site", "Site do VLC")).size(13))
+                        .on_press(Message::OpenToolPage(ToolPage::Vlc))
+                        .padding([8, 12])
+                        .style(quiet_button),
                 ]
-                .spacing(10)
+                .spacing(8)
                 .align_y(Alignment::Center),
             ]
             .spacing(14),
         )
     }
 
-    fn deno_note(&self) -> Element<'_, Message> {
+    fn preview_player_note(&self) -> Element<'_, Message> {
+        let mut actions = row![].spacing(10).align_y(Alignment::Center);
+        if can_auto_install() {
+            actions = actions.push(
+                button(
+                    text(if self.installing_tools {
+                        self.t("Installing…", "Instalando…")
+                    } else {
+                        self.t("Install VLC", "Instalar VLC")
+                    })
+                    .size(13),
+                )
+                .on_press_maybe((!self.installing_tools).then_some(Message::InstallMissingTools))
+                .padding([8, 12])
+                .style(if self.installing_tools {
+                    busy_button
+                } else {
+                    primary_button
+                }),
+            );
+        }
+        actions = actions.push(
+            button(text(self.t("Copy commands", "Copiar comandos")).size(13))
+                .on_press(Message::CopyInstallCommands)
+                .padding([8, 12])
+                .style(secondary_button),
+        );
+        actions = actions.push(
+            button(text(self.t("Check again", "Verificar de novo")).size(13))
+                .on_press_maybe((!self.installing_tools).then_some(Message::RecheckTools))
+                .padding([8, 12])
+                .style(secondary_button),
+        );
+        actions = actions.push(
+            button(text(self.t("VLC site", "Site do VLC")).size(13))
+                .on_press(Message::OpenToolPage(ToolPage::Vlc))
+                .padding([8, 12])
+                .style(secondary_button),
+        );
         container(
-            row![
-                column![
-                    text(self.t(
-                        "Deno was not found. YouTube may fail or expose fewer formats.",
-                        "O Deno não foi encontrado. O YouTube pode falhar ou mostrar menos formatos.",
-                    ))
-                    .size(13)
-                    .color(TEXT),
-                    text(deno_install_hint(self.language)).size(12).color(MUTED),
-                ]
-                .spacing(4)
-                .width(Fill),
-                button(text(self.t("Check again", "Verificar de novo")).size(13))
-                    .on_press(Message::RecheckTools)
-                    .padding([8, 12])
-                    .style(secondary_button),
-                button(text(self.t("Deno site", "Site do Deno")).size(13))
-                    .on_press(Message::OpenToolPage(ToolPage::Deno))
-                    .padding([8, 12])
-                    .style(secondary_button),
+            column![
+                text(self.t(
+                    "Preview is using FFplay, which has few controls. Install VLC for pause, seek, and volume like on Linux.",
+                    "A prévia está no FFplay, com poucos controles. Instale o VLC para pause, seek e volume como no Linux.",
+                ))
+                .size(13)
+                .color(TEXT),
+                text(self.t(
+                    "winget install --id VideoLAN.VLC -e --accept-package-agreements --accept-source-agreements",
+                    "winget install --id VideoLAN.VLC -e --accept-package-agreements --accept-source-agreements",
+                ))
+                .size(12)
+                .color(MUTED),
+                self.install_progress_panel(),
+                actions,
             ]
-            .spacing(10)
-            .align_y(Alignment::Center),
+            .spacing(10),
         )
         .width(Fill)
         .padding([12, 16])
+        .style(|_theme| inset_style())
+        .into()
+    }
+
+    fn deno_note(&self) -> Element<'_, Message> {
+        let mut actions = row![].spacing(10).align_y(Alignment::Center);
+        if can_auto_install() {
+            actions = actions.push(
+                button(
+                    text(if self.installing_tools {
+                        self.t("Installing…", "Instalando…")
+                    } else {
+                        self.t("Install Deno", "Instalar Deno")
+                    })
+                    .size(13),
+                )
+                .on_press_maybe((!self.installing_tools).then_some(Message::InstallMissingTools))
+                .padding([8, 12])
+                .style(if self.installing_tools {
+                    busy_button
+                } else {
+                    primary_button
+                }),
+            );
+        }
+        actions = actions.push(
+            button(text(self.t("Copy command", "Copiar comando")).size(13))
+                .on_press(Message::CopyInstallCommands)
+                .padding([8, 12])
+                .style(secondary_button),
+        );
+        actions = actions.push(
+            button(text(self.t("Check again", "Verificar de novo")).size(13))
+                .on_press_maybe((!self.installing_tools).then_some(Message::RecheckTools))
+                .padding([8, 12])
+                .style(secondary_button),
+        );
+        actions = actions.push(
+            button(text(self.t("Deno site", "Site do Deno")).size(13))
+                .on_press(Message::OpenToolPage(ToolPage::Deno))
+                .padding([8, 12])
+                .style(secondary_button),
+        );
+        container(
+            column![
+                text(self.t(
+                    "Deno was not found. YouTube may fail or expose fewer formats.",
+                    "O Deno não foi encontrado. O YouTube pode falhar ou mostrar menos formatos.",
+                ))
+                .size(13)
+                .color(TEXT),
+                text(deno_install_hint(self.language)).size(12).color(MUTED),
+                self.install_progress_panel(),
+                actions,
+            ]
+            .spacing(10),
+        )
+        .width(Fill)
+        .padding([12, 16])
+        .style(|_theme| inset_style())
+        .into()
+    }
+
+    fn install_progress_panel(&self) -> Element<'_, Message> {
+        let Some(progress) = self
+            .install_progress
+            .as_ref()
+            .filter(|_| self.installing_tools)
+        else {
+            return iced::widget::Space::new().height(0).into();
+        };
+        let current = progress.current.load(Ordering::Relaxed);
+        let total = progress.total.load(Ordering::Relaxed).max(1);
+        let fraction = (current as f32 / total as f32).clamp(0.0, 1.0) * 100.0;
+        container(
+            column![
+                text(progress.summary(self.language)).size(14).color(TEXT),
+                text(self.t(
+                    "Winget downloads can take a minute. Keep ClipForge open.",
+                    "O download do winget pode levar um minuto. Mantenha o ClipForge aberto.",
+                ))
+                .size(12)
+                .color(MUTED),
+                progress_bar(0.0..=100.0, fraction)
+                    .girth(6)
+                    .style(export_progress_style),
+            ]
+            .spacing(8),
+        )
+        .width(Fill)
+        .padding(14)
         .style(|_theme| inset_style())
         .into()
     }
@@ -1609,10 +1893,15 @@ impl App {
                 "Move the pointer over the video to show the volume control.",
                 "Passe o mouse sobre o vídeo para mostrar o volume.",
             )
-        } else {
+        } else if in_app_preview_volume_supported() {
             self.t(
                 "Volume buttons stay in ClipForge while the preview plays.",
                 "Os botões de volume ficam no ClipForge enquanto a pré-visualização toca.",
+            )
+        } else {
+            self.t(
+                "Use 0-9 or the arrow keys in the preview window to change volume.",
+                "Use 0-9 ou as setas na janela da pré-visualização para mudar o volume.",
             )
         }
     }
@@ -1980,6 +2269,7 @@ impl Default for Toolchain {
 
 impl Toolchain {
     fn probe() -> Self {
+        refresh_process_path();
         Self {
             ytdlp: resolve_executable("yt-dlp"),
             ffmpeg: resolve_executable("ffmpeg"),
@@ -2003,6 +2293,62 @@ impl Toolchain {
         }
         missing
     }
+
+    fn has_preview_player(&self) -> bool {
+        self.vlc.is_some() || self.mpv.is_some()
+    }
+
+    fn has_installable_gap(&self) -> bool {
+        self.ytdlp.is_none()
+            || self.ffmpeg.is_none()
+            || self.deno.is_none()
+            || !self.has_preview_player()
+    }
+
+    fn packages_to_install(&self) -> Vec<WingetPackage> {
+        let mut packages = Vec::new();
+        if self.ytdlp.is_none() {
+            packages.push(WingetPackage::YtDlp);
+        }
+        if self.ffmpeg.is_none() {
+            packages.push(WingetPackage::Ffmpeg);
+        }
+        if self.deno.is_none() {
+            packages.push(WingetPackage::Deno);
+        }
+        if !self.has_preview_player() {
+            packages.push(WingetPackage::Vlc);
+        }
+        packages
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WingetPackage {
+    YtDlp,
+    Ffmpeg,
+    Deno,
+    Vlc,
+}
+
+impl WingetPackage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::YtDlp => "yt-dlp",
+            Self::Ffmpeg => "FFmpeg",
+            Self::Deno => "Deno",
+            Self::Vlc => "VLC",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::YtDlp => "yt-dlp.yt-dlp",
+            Self::Ffmpeg => "Gyan.FFmpeg",
+            Self::Deno => "DenoLand.Deno",
+            Self::Vlc => "VideoLAN.VLC",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2010,6 +2356,7 @@ enum ToolPage {
     YtDlp,
     Ffmpeg,
     Deno,
+    Vlc,
 }
 
 impl ToolPage {
@@ -2018,6 +2365,7 @@ impl ToolPage {
             Self::YtDlp => "https://github.com/yt-dlp/yt-dlp#installation",
             Self::Ffmpeg => "https://ffmpeg.org/download.html",
             Self::Deno => "https://docs.deno.com/runtime/getting_started/installation/",
+            Self::Vlc => "https://www.videolan.org/vlc/",
         }
     }
 }
@@ -2043,25 +2391,17 @@ fn find_named_tool(directories: &[PathBuf], name: &str) -> Option<PathBuf> {
 fn tool_search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(dir) = app_directory() {
-        push_unique_dir(&mut dirs, dir.join("tools"));
         push_unique_dir(&mut dirs, dir);
     }
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
+    #[cfg(windows)]
     {
-        let parent = parent.to_path_buf();
-        push_unique_dir(&mut dirs, parent.join("tools"));
-        push_unique_dir(&mut dirs, parent);
+        for directory in windows_known_tool_dirs() {
+            push_unique_dir(&mut dirs, directory);
+        }
     }
     #[cfg(windows)]
-    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        push_unique_dir(
-            &mut dirs,
-            PathBuf::from(local)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Links"),
-        );
+    if let Some(home) = user_home() {
+        push_unique_dir(&mut dirs, home.join(".deno").join("bin"));
     }
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {
@@ -2069,6 +2409,78 @@ fn tool_search_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+#[cfg(windows)]
+fn windows_known_tool_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        push_unique_dir(
+            &mut dirs,
+            local.join("Microsoft").join("WinGet").join("Links"),
+        );
+        push_unique_dir(
+            &mut dirs,
+            local.join("Programs").join("VideoLAN").join("VLC"),
+        );
+        push_unique_dir(&mut dirs, local.join("Programs").join("VLC"));
+        push_unique_dir(&mut dirs, local.join("Programs").join("mpv"));
+        let packages = local.join("Microsoft").join("WinGet").join("Packages");
+        if let Ok(entries) = std::fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // yt-dlp.exe and deno.exe usually sit in the package root.
+                push_unique_dir(&mut dirs, path.clone());
+                collect_winget_bin_dirs(&path, &mut dirs, 0);
+            }
+        }
+    }
+    for key in [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+    ] {
+        if let Some(root) = std::env::var_os(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            push_unique_dir(&mut dirs, root.join("VideoLAN").join("VLC"));
+            push_unique_dir(&mut dirs, root.join("mpv"));
+            push_unique_dir(&mut dirs, root.join("mpv.net"));
+        }
+    }
+    dirs
+}
+
+#[cfg(windows)]
+fn collect_winget_bin_dirs(dir: &std::path::Path, dirs: &mut Vec<PathBuf>, depth: u8) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+        {
+            push_unique_dir(dirs, path.clone());
+        }
+        collect_winget_bin_dirs(&path, dirs, depth + 1);
+    }
 }
 
 fn push_unique_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
@@ -2090,10 +2502,6 @@ fn app_directory() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))
-}
-
-fn tools_directory() -> Option<PathBuf> {
-    app_directory().map(|dir| dir.join("tools"))
 }
 
 fn executable_names(name: &str) -> Vec<String> {
@@ -2132,6 +2540,9 @@ fn prepare_media_command(program: PathBuf) -> tokio::process::Command {
     if let Ok(path) = std::env::join_paths(tool_search_dirs()) {
         command.env("PATH", path);
     }
+    // yt-dlp and FFmpeg are console apps on Windows; without this they open an empty terminal.
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     command
 }
 
@@ -2146,13 +2557,30 @@ fn export_blocker(toolchain: &Toolchain, language: Language) -> Option<String> {
     }
     let names = missing.join(", ");
     Some(match language {
-        Language::Portuguese => format!(
-            "Falta instalar: {names}. Siga as instruções acima e clique em Verificar de novo."
-        ),
+        Language::Portuguese if can_auto_install() => {
+            format!("Falta instalar: {names}. Aceite Instalar o que falta, ou copie os comandos.")
+        }
+        Language::Portuguese => {
+            format!("Falta instalar: {names}. Copie os comandos acima e tente de novo.")
+        }
+        Language::English if can_auto_install() => {
+            format!("Still missing: {names}. Choose Install missing tools, or copy the commands.")
+        }
         Language::English => {
-            format!("Still missing: {names}. Follow the instructions above and choose Check again.")
+            format!("Still missing: {names}. Copy the commands above and try again.")
         }
     })
+}
+
+fn can_auto_install() -> bool {
+    #[cfg(windows)]
+    {
+        resolve_executable("winget").is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn toolchain_summary(toolchain: &Toolchain, language: Language) -> String {
@@ -2176,39 +2604,43 @@ fn toolchain_summary(toolchain: &Toolchain, language: Language) -> String {
     }
 }
 
+fn install_commands_text(language: Language) -> String {
+    let _ = language;
+    #[cfg(windows)]
+    {
+        "winget install --id yt-dlp.yt-dlp -e --accept-package-agreements --accept-source-agreements\n\
+winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements\n\
+winget install --id DenoLand.Deno -e --accept-package-agreements --accept-source-agreements\n\
+winget install --id VideoLAN.VLC -e --accept-package-agreements --accept-source-agreements"
+            .into()
+    }
+    #[cfg(not(windows))]
+    {
+        linux_install_command().into()
+    }
+}
+
 fn install_instructions(language: Language) -> String {
+    let commands = install_commands_text(language);
     #[cfg(windows)]
     {
         match language {
-            Language::Portuguese => "\
-No Terminal do Windows:
-
-winget install yt-dlp.yt-dlp
-winget install Gyan.FFmpeg
-winget install DenoLand.Deno
-
-Feche e abra o ClipForge. Um programa que já está aberto não enxerga o PATH novo."
-                .into(),
-            Language::English => "\
-In Windows Terminal:
-
-winget install yt-dlp.yt-dlp
-winget install Gyan.FFmpeg
-winget install DenoLand.Deno
-
-Quit and reopen ClipForge. A program that is already open does not see the new PATH."
-                .into(),
+            Language::Portuguese => format!(
+                "Comandos no Terminal do Windows:\n\n{commands}\n\nSe a instalação automática não atualizar o PATH, feche e abra o ClipForge."
+            ),
+            Language::English => format!(
+                "Windows Terminal commands:\n\n{commands}\n\nIf automatic install does not refresh PATH, quit and reopen ClipForge."
+            ),
         }
     }
     #[cfg(not(windows))]
     {
-        let packages = linux_install_command();
         match language {
             Language::Portuguese => format!(
-                "No terminal:\n\n{packages}\n\nO Deno é opcional e recomendado para o YouTube. Use a página oficial se a distribuição não tiver o pacote."
+                "No terminal:\n\n{commands}\n\nO Deno é opcional e recomendado para o YouTube. Use a página oficial se a distribuição não tiver o pacote."
             ),
             Language::English => format!(
-                "In a terminal:\n\n{packages}\n\nDeno is optional and recommended for YouTube. Use the official page if your distribution has no package."
+                "In a terminal:\n\n{commands}\n\nDeno is optional and recommended for YouTube. Use the official page if your distribution has no package."
             ),
         }
     }
@@ -2233,7 +2665,8 @@ fn deno_install_hint(language: Language) -> String {
     #[cfg(windows)]
     {
         let _language = language;
-        "winget install DenoLand.Deno".into()
+        "winget install --id DenoLand.Deno -e --accept-package-agreements --accept-source-agreements"
+            .into()
     }
     #[cfg(not(windows))]
     {
@@ -2248,25 +2681,182 @@ fn deno_install_hint(language: Language) -> String {
     }
 }
 
-fn tools_drop_hint(language: Language) -> String {
-    let folder = tools_directory()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "tools".into());
+fn refresh_process_path() {
     #[cfg(windows)]
-    let files_pt = "yt-dlp.exe, ffmpeg.exe e ffplay.exe";
+    {
+        let Some(path) = windows_registry_path() else {
+            return;
+        };
+        // SAFETY: ClipForge only refreshes PATH around tool probing on the UI thread.
+        unsafe { std::env::set_var("PATH", path) };
+    }
+}
+
+#[cfg(windows)]
+fn windows_registry_path() -> Option<String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!path.is_empty()).then_some(path)
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+fn winget_code(status: &std::process::ExitStatus) -> u32 {
+    status.code().map(|code| code as u32).unwrap_or(u32::MAX)
+}
+
+fn winget_result_is_ok(code: u32) -> bool {
+    matches!(
+        code,
+        0
+            // Already up to date / no applicable update.
+            | 0x8A15_002B
+            // Package already installed.
+            | 0x8A15_0061
+            | 0x8A15_010D
+    )
+}
+
+fn winget_code_message(code: u32, package: &str, language: Language) -> String {
+    match (code, language) {
+        (0x8A15_002B, Language::Portuguese) => format!(
+            "O winget diz que {package} já está atualizado. Se o ClipForge ainda não o encontra, reinicie o app."
+        ),
+        (0x8A15_002B, Language::English) => format!(
+            "winget says {package} is already up to date. If ClipForge still cannot find it, reopen the app."
+        ),
+        (0x8A15_0061 | 0x8A15_010D, Language::Portuguese) => {
+            format!("{package} já estava instalado.")
+        }
+        (0x8A15_0061 | 0x8A15_010D, Language::English) => {
+            format!("{package} was already installed.")
+        }
+        (_, Language::Portuguese) => format!(
+            "O winget não conseguiu instalar {package} (0x{code:08x}). Copie os comandos e instale manualmente."
+        ),
+        (_, Language::English) => format!(
+            "winget could not install {package} (0x{code:08x}). Copy the commands and install it manually."
+        ),
+    }
+}
+
+async fn install_missing_tools(
+    toolchain: Toolchain,
+    language: Language,
+    progress: Arc<InstallProgress>,
+) -> Result<String, String> {
     #[cfg(windows)]
-    let files_en = "yt-dlp.exe, ffmpeg.exe, and ffplay.exe";
-    #[cfg(not(windows))]
-    let files_pt = "yt-dlp, ffmpeg e ffplay";
-    #[cfg(not(windows))]
-    let files_en = "yt-dlp, ffmpeg, and ffplay";
-    match language {
-        Language::Portuguese => {
-            format!("Ou coloque {files_pt} nesta pasta e clique em Verificar de novo:\n{folder}")
+    {
+        if resolve_executable("winget").is_none() {
+            return Err(match language {
+                Language::Portuguese => {
+                    "O winget não foi encontrado. Instale o Instalador de Aplicativos da Microsoft Store, ou copie os comandos."
+                        .into()
+                }
+                Language::English => {
+                    "winget was not found. Install App Installer from Microsoft Store, or copy the commands."
+                        .into()
+                }
+            });
         }
-        Language::English => {
-            format!("Or place {files_en} in this folder and choose Check again:\n{folder}")
+        let packages = toolchain.packages_to_install();
+        progress
+            .total
+            .store(packages.len().max(1) as u8, Ordering::Relaxed);
+        if packages.is_empty() {
+            return Ok(match language {
+                Language::Portuguese => "Tudo o que é necessário já está instalado.".into(),
+                Language::English => "Everything needed is already installed.".into(),
+            });
         }
+        let mut installed = Vec::new();
+        let mut notes = Vec::new();
+        for (index, package) in packages.iter().enumerate() {
+            progress.set_package((index + 1) as u8, package.label(), language);
+            let status = tokio::process::Command::new("winget")
+                .args([
+                    "install",
+                    "--id",
+                    package.id(),
+                    "-e",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                    "--disable-interactivity",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .await
+                .map_err(|error| match language {
+                    Language::Portuguese => format!("Não foi possível iniciar o winget: {error}"),
+                    Language::English => format!("Could not start winget: {error}"),
+                })?;
+            let code = winget_code(&status);
+            if winget_result_is_ok(code) {
+                installed.push(package.label());
+                if code != 0 {
+                    notes.push(winget_code_message(code, package.label(), language));
+                }
+                continue;
+            }
+            let message = winget_code_message(code, package.label(), language);
+            if matches!(package, WingetPackage::Deno | WingetPackage::Vlc) {
+                notes.push(message);
+                continue;
+            }
+            return Err(message);
+        }
+        refresh_process_path();
+        let mut summary = match language {
+            Language::Portuguese => format!(
+                "Instalação concluída: {}. Clique em Verificar de novo se ainda faltar alguma ferramenta.",
+                installed.join(", ")
+            ),
+            Language::English => format!(
+                "Install finished: {}. Choose Check again if a tool is still missing.",
+                installed.join(", ")
+            ),
+        };
+        if !notes.is_empty() {
+            summary.push(' ');
+            summary.push_str(&notes.join(" "));
+        }
+        Ok(summary)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (toolchain, progress);
+        Err(match language {
+            Language::Portuguese => {
+                "A instalação automática está disponível no Windows com o winget. Copie os comandos da sua distribuição."
+                    .into()
+            }
+            Language::English => {
+                "Automatic install is available on Windows with winget. Copy the commands for your distribution."
+                    .into()
+            }
+        })
     }
 }
 
@@ -2320,20 +2910,6 @@ async fn open_web_page(url: &'static str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("Could not open the installation page: {error}"))
-}
-
-async fn open_tools_folder() -> Result<(), String> {
-    let Some(dir) = tools_directory() else {
-        return Err("Could not locate the tools folder.".into());
-    };
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|error| format!("Could not create the tools folder: {error}"))?;
-    let path = dir.to_string_lossy().into_owned();
-    open_command(&path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Could not open the tools folder: {error}"))
 }
 
 fn history_file() -> Option<PathBuf> {
@@ -2435,6 +3011,7 @@ fn open_command(path: &str) -> tokio::process::Command {
     {
         let mut command = tokio::process::Command::new("cmd");
         command.args(["/C", "start", "", path]);
+        command.creation_flags(CREATE_NO_WINDOW);
         command
     }
     #[cfg(not(windows))]
@@ -2975,14 +3552,117 @@ fn preview_opened_notice(player: PreviewPlayer, language: Language) -> String {
             }
         }
         PreviewPlayer::Ffplay => {
-            if portuguese {
-                "Pré-visualização aberta. Ajuste o volume aqui."
+            if in_app_preview_volume_supported() {
+                if portuguese {
+                    "Pré-visualização aberta. Ajuste o volume aqui."
+                } else {
+                    "Preview opened. Adjust the volume here."
+                }
+            } else if portuguese {
+                "Pré-visualização aberta no FFplay (controles limitados). Instale o VLC para pause, seek e volume."
             } else {
-                "Preview opened. Adjust the volume here."
+                "Preview opened in FFplay (limited controls). Install VLC for pause, seek, and volume."
             }
         }
     }
     .to_owned()
+}
+
+fn in_app_preview_volume_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn schedule_preview_window_style() {
+    #[cfg(windows)]
+    {
+        tokio::spawn(async {
+            style_preview_window().await;
+        });
+    }
+}
+
+#[cfg(windows)]
+async fn style_preview_window() {
+    for _ in 0..50 {
+        if apply_dark_title_bar(PREVIEW_WINDOW_TITLE) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(windows)]
+struct PreviewWindowSearch {
+    title: String,
+    found: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(windows)]
+fn apply_dark_title_bar(title: &str) -> bool {
+    let search = PreviewWindowSearch {
+        title: title.to_owned(),
+        found: std::sync::atomic::AtomicBool::new(false),
+    };
+    unsafe {
+        EnumWindows(Some(enum_preview_windows), &raw const search as isize);
+    }
+    search.found.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_preview_windows(hwnd: Hwnd, lparam: isize) -> i32 {
+    let search = unsafe { &*(lparam as *const PreviewWindowSearch) };
+    let mut buffer = [0u16; 512];
+    let length = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        return 1;
+    }
+    let window_title = String::from_utf16_lossy(&buffer[..length as usize]);
+    if window_title != search.title {
+        return 1;
+    }
+    let enabled: i32 = 1;
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw const enabled).cast(),
+            std::mem::size_of_val(&enabled) as u32,
+        )
+    };
+    if result >= 0 {
+        search
+            .found
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    1
+}
+
+#[cfg(windows)]
+type Hwnd = *mut std::ffi::c_void;
+
+#[cfg(windows)]
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn EnumWindows(
+        callback: Option<unsafe extern "system" fn(Hwnd, isize) -> i32>,
+        lparam: isize,
+    ) -> i32;
+    fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max_count: i32) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: Hwnd,
+        attribute: u32,
+        value: *const std::ffi::c_void,
+        size: u32,
+    ) -> i32;
 }
 
 async fn launch_preview(
@@ -2991,79 +3671,152 @@ async fn launch_preview(
     end: u64,
     progress: Arc<PreviewProgress>,
 ) -> Result<PreviewPlayer, String> {
-    progress.set(PreviewStage::Resolving);
-    if command_exists("vlc") {
-        match launch_vlc(&url, start, end, progress.clone()).await {
-            Ok(player) => return Ok(player),
-            Err(error) => {
-                log::warn!("VLC preview failed: {error}");
-                if !command_exists("mpv") && !command_exists("ffplay") {
-                    progress.set(PreviewStage::Failed);
-                    return Err(error);
-                }
-                progress.set(PreviewStage::Resolving);
-            }
-        }
-    }
-    if command_exists("mpv") {
-        let mut player = media_tool("mpv")?
-            .args([
-                "--force-window=yes".to_owned(),
-                "--osc=yes".to_owned(),
-                "--script-opts=osc-visibility=always".to_owned(),
-                "--speed=1".to_owned(),
-                format!("--start={}", format_time(start)),
-                format!("--end={}", format_time(end)),
-                "--".to_owned(),
-                url,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false)
-            .spawn()
-            .map_err(|error| format!("Could not launch MPV: {error}"))?;
-        progress.set(PreviewStage::Buffering);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        if let Some(status) = player
-            .try_wait()
-            .map_err(|error| format!("Could not check MPV startup: {error}"))?
-        {
-            if !status.success() {
-                progress.set(PreviewStage::Failed);
-                return Err("MPV could not open the video URL.".into());
-            }
-            progress.set(PreviewStage::Finished);
-            return Ok(PreviewPlayer::Mpv);
-        }
-        progress.set(PreviewStage::Playing);
-        tokio::spawn(async move {
-            let status = player.wait().await;
-            progress.set(if status.is_ok_and(|status| status.success()) {
-                PreviewStage::Finished
-            } else {
-                PreviewStage::Failed
-            });
-        });
-        return Ok(PreviewPlayer::Mpv);
-    }
-
-    if !command_exists("ffplay") {
+    if !command_exists("vlc") && !command_exists("mpv") && !command_exists("ffplay") {
         return Err("Install VLC, MPV, or FFplay to preview the selected interval.".into());
     }
-    let streams = preview_stream_urls(&url).await?;
-    progress.set(PreviewStage::Buffering);
-    match streams.as_slice() {
-        [stream] => spawn_ffplay(stream, start, end, progress).await,
-        [video, audio] if command_exists("ffmpeg") => {
-            spawn_synced_preview(video, audio, start, end, progress).await
+    // Download only the selected interval so the player never opens the full source.
+    let (mut temp_dir, clip) = download_preview_section(&url, start, end, progress.clone()).await?;
+    let path = clip.to_string_lossy().into_owned();
+    let mut last_error = None;
+
+    if command_exists("vlc") {
+        match spawn_local_preview_player(
+            "vlc",
+            &vlc_local_preview_args(&path),
+            progress.clone(),
+            PreviewPlayer::Vlc,
+            "VLC",
+            "VLC could not open the preview.",
+            temp_dir,
+        )
+        .await
+        {
+            Ok(player) => return Ok(player),
+            Err((error, returned_dir)) => {
+                log::warn!("VLC preview failed: {error}");
+                last_error = Some(error);
+                temp_dir = returned_dir;
+            }
         }
-        [video, _] => spawn_ffplay(video, start, end, progress).await,
-        _ => Err("yt-dlp returned an unsupported number of preview streams.".into()),
     }
+
+    if command_exists("mpv") {
+        match spawn_local_preview_player(
+            "mpv",
+            &mpv_local_preview_args(&path),
+            progress.clone(),
+            PreviewPlayer::Mpv,
+            "MPV",
+            "MPV could not open the preview.",
+            temp_dir,
+        )
+        .await
+        {
+            Ok(player) => return Ok(player),
+            Err((error, returned_dir)) => {
+                log::warn!("MPV preview failed: {error}");
+                last_error = Some(error);
+                temp_dir = returned_dir;
+            }
+        }
+    }
+
+    if command_exists("ffplay") {
+        return spawn_local_preview_player(
+            "ffplay",
+            &ffplay_local_preview_args(&path),
+            progress,
+            PreviewPlayer::Ffplay,
+            "FFplay",
+            "FFplay could not open the preview.",
+            temp_dir,
+        )
+        .await
+        .map_err(|(error, _)| error);
+    }
+
+    progress.set(PreviewStage::Failed);
+    Err(last_error
+        .unwrap_or_else(|| "Install VLC, MPV, or FFplay to preview the selected interval.".into()))
 }
 
-fn vlc_common_args() -> Vec<String> {
+fn build_preview_download_args(url: &str, start: u64, end: u64, template: &str) -> Vec<String> {
+    vec![
+        "--newline".into(),
+        "--ignore-config".into(),
+        "--no-warnings".into(),
+        "--no-playlist".into(),
+        "--download-sections".into(),
+        format!("*{}-{}", format_time(start), format_time(end)),
+        "-f".into(),
+        "bv*[height<=1080]+ba/b".into(),
+        "--merge-output-format".into(),
+        "mp4".into(),
+        "-o".into(),
+        template.into(),
+        url.into(),
+    ]
+}
+
+async fn download_preview_section(
+    url: &str,
+    start: u64,
+    end: u64,
+    progress: Arc<PreviewProgress>,
+) -> Result<(tempfile::TempDir, PathBuf), String> {
+    progress.set(PreviewStage::Resolving);
+    let temp_dir = tempfile::Builder::new()
+        .prefix("clipforge-preview-")
+        .tempdir()
+        .map_err(|error| format!("Could not create a preview temp folder: {error}"))?;
+    let template = temp_dir.path().join("preview.%(ext)s");
+    let template = template.to_string_lossy().into_owned();
+    let args = build_preview_download_args(url, start, end, &template);
+    progress.set(PreviewStage::Buffering);
+    let output = media_tool("yt-dlp")?
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| format!("Could not download the preview section: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            format!(
+                "yt-dlp failed to download the preview section ({}).",
+                output.status
+            )
+        } else {
+            format!("yt-dlp could not download the preview section: {detail}")
+        });
+    }
+    let mut entries = tokio::fs::read_dir(temp_dir.path())
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut clip = None;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mkv" | "webm"))
+        {
+            clip = Some(path);
+            break;
+        }
+    }
+    let clip =
+        clip.ok_or_else(|| "yt-dlp completed without producing a preview media file.".to_owned())?;
+    Ok((temp_dir, clip))
+}
+
+fn vlc_local_preview_args(path: &str) -> Vec<String> {
     vec![
         "--ignore-config".into(),
         "--intf=qt".into(),
@@ -3075,308 +3828,97 @@ fn vlc_common_args() -> Vec<String> {
         "--no-qt-system-tray".into(),
         "--qt-notification=0".into(),
         "--qt-continue=0".into(),
-        "--meta-title=ClipForge preview".into(),
+        format!("--meta-title={PREVIEW_WINDOW_TITLE}"),
+        "--".into(),
+        path.into(),
     ]
 }
 
-fn vlc_preview_args(url: &str, start: u64, end: u64) -> Vec<String> {
-    let mut args = vlc_common_args();
-    args.push(format!("--start-time={start}"));
-    args.push(format!("--stop-time={end}"));
-    args.push("--".into());
-    args.push(url.to_owned());
-    args
+fn mpv_local_preview_args(path: &str) -> Vec<String> {
+    vec![
+        "--force-window=yes".into(),
+        "--osc=yes".into(),
+        "--script-opts=osc-visibility=always".into(),
+        "--speed=1".into(),
+        format!("--title={PREVIEW_WINDOW_TITLE}"),
+        "--".into(),
+        path.into(),
+    ]
 }
 
-fn vlc_slave_args(video: &str, audio: &str, start: u64, end: u64) -> Vec<String> {
-    let mut args = vlc_common_args();
-    args.push(format!("--start-time={start}"));
-    args.push(format!("--stop-time={end}"));
-    args.push(format!("--input-slave={audio}"));
-    args.push("--".into());
-    args.push(video.to_owned());
-    args
-}
-
-async fn launch_vlc(
-    url: &str,
-    start: u64,
-    end: u64,
-    progress: Arc<PreviewProgress>,
-) -> Result<PreviewPlayer, String> {
-    let streams = preview_stream_urls(url).await?;
-    progress.set(PreviewStage::Buffering);
-    let args = match streams.as_slice() {
-        [stream] => vlc_preview_args(stream, start, end),
-        [video, audio] => vlc_slave_args(video, audio, start, end),
-        _ => {
-            return Err("yt-dlp returned an unsupported number of preview streams.".into());
-        }
-    };
-    spawn_detached_player(
-        "vlc",
-        &args,
-        progress,
-        PreviewPlayer::Vlc,
-        "VLC",
-        "VLC could not open the preview.",
-    )
-    .await
-}
-
-async fn spawn_detached_player(
-    program: &str,
-    args: &[String],
-    progress: Arc<PreviewProgress>,
-    player: PreviewPlayer,
-    label: &str,
-    failure: &'static str,
-) -> Result<PreviewPlayer, String> {
-    let mut child = media_tool(program)?
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(false)
-        .spawn()
-        .map_err(|error| format!("Could not launch {label}: {error}"))?;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|error| format!("Could not check {label} startup: {error}"))?
-    {
-        progress.set(if status.success() {
-            PreviewStage::Finished
-        } else {
-            PreviewStage::Failed
-        });
-        if !status.success() {
-            return Err(failure.to_owned());
-        }
-        return Ok(player);
-    }
-    progress.set(PreviewStage::Playing);
-    tokio::spawn(async move {
-        let status = child.wait().await;
-        progress.set(if status.is_ok_and(|status| status.success()) {
-            PreviewStage::Finished
-        } else {
-            PreviewStage::Failed
-        });
-    });
-    Ok(player)
-}
-
-fn ffplay_preview_args(url: &str, start: u64, end: u64) -> Vec<String> {
+fn ffplay_local_preview_args(path: &str) -> Vec<String> {
     vec![
         "-hide_banner".into(),
         "-autoexit".into(),
         "-loglevel".into(),
         "error".into(),
         "-window_title".into(),
-        "ClipForge preview".into(),
-        "-ss".into(),
-        format_time(start),
-        "-t".into(),
-        end.saturating_sub(start).to_string(),
+        PREVIEW_WINDOW_TITLE.into(),
         "-i".into(),
-        url.into(),
+        path.into(),
     ]
 }
 
-fn synced_preview_args(video: &str, audio: &str, start: u64, end: u64) -> Vec<String> {
-    vec![
-        "-nostdin".into(),
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
-        "-ss".into(),
-        format_time(start),
-        "-i".into(),
-        video.into(),
-        "-ss".into(),
-        format_time(start),
-        "-i".into(),
-        audio.into(),
-        "-t".into(),
-        end.saturating_sub(start).to_string(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        "1:a:0?".into(),
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "ultrafast".into(),
-        "-tune".into(),
-        "zerolatency".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "128k".into(),
-        "-fps_mode".into(),
-        "passthrough".into(),
-        "-f".into(),
-        "matroska".into(),
-        "pipe:1".into(),
-    ]
-}
-
-async fn preview_stream_urls(url: &str) -> Result<Vec<String>, String> {
-    let output = media_tool("yt-dlp")?
-        .args([
-            "--ignore-config",
-            "--no-warnings",
-            "--no-playlist",
-            "--get-url",
-            "-f",
-            "b/bv*+ba/b",
-            "--",
-            url,
-        ])
-        .output()
-        .await
-        .map_err(|error| format!("Could not resolve video stream for preview: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if detail.is_empty() {
-            format!(
-                "yt-dlp failed to resolve a preview stream ({}).",
-                output.status
-            )
-        } else {
-            format!("yt-dlp could not resolve a preview stream: {detail}")
-        });
-    }
-    let streams: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| line.starts_with("https://"))
-        .map(str::to_owned)
-        .collect();
-    if streams.is_empty() || streams.len() > 2 {
-        return Err("yt-dlp returned an unsupported number of preview streams.".into());
-    }
-    Ok(streams)
-}
-
-async fn spawn_ffplay(
-    url: &str,
-    start: u64,
-    end: u64,
+async fn spawn_local_preview_player(
+    program: &str,
+    args: &[String],
     progress: Arc<PreviewProgress>,
-) -> Result<PreviewPlayer, String> {
-    let mut player = media_tool("ffplay")?
-        .args(ffplay_preview_args(url, start, end))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(false)
-        .spawn()
-        .map_err(|error| format!("Could not launch FFplay: {error}"))?;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    if let Some(status) = player
-        .try_wait()
-        .map_err(|error| format!("Could not check FFplay startup: {error}"))?
-    {
-        progress.set(if status.success() {
-            PreviewStage::Finished
-        } else {
-            PreviewStage::Failed
-        });
-        if !status.success() {
-            return Err("FFplay could not open the preview.".into());
-        }
-        return Ok(PreviewPlayer::Ffplay);
-    }
-    progress.set(PreviewStage::Playing);
-    tokio::spawn(async move {
-        let status = player.wait().await;
-        progress.set(if status.is_ok_and(|status| status.success()) {
-            PreviewStage::Finished
-        } else {
-            PreviewStage::Failed
-        });
-    });
-    Ok(PreviewPlayer::Ffplay)
-}
-
-async fn spawn_synced_preview(
-    video: &str,
-    audio: &str,
-    start: u64,
-    end: u64,
-    progress: Arc<PreviewProgress>,
-) -> Result<PreviewPlayer, String> {
-    let mut transcoder = media_tool("ffmpeg")?
-        .args(synced_preview_args(video, audio, start, end))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| format!("Could not start FFmpeg preview stream: {error}"))?;
-    let mut ffmpeg_output = transcoder
-        .stdout
-        .take()
-        .ok_or_else(|| "FFmpeg preview output was unavailable.".to_owned())?;
-    let mut player = match media_tool("ffplay")?
-        .args([
-            "-hide_banner",
-            "-autoexit",
-            "-loglevel",
-            "error",
-            "-window_title",
-            "ClipForge preview",
-            "-sync",
-            "video",
-            "-i",
-            "pipe:0",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(false)
-        .spawn()
-    {
-        Ok(player) => player,
-        Err(error) => {
-            let _ = transcoder.kill().await;
-            let _ = transcoder.wait().await;
-            return Err(format!("Could not launch FFplay: {error}"));
-        }
+    player: PreviewPlayer,
+    label: &str,
+    failure: &'static str,
+    temp_dir: tempfile::TempDir,
+) -> Result<PreviewPlayer, (String, tempfile::TempDir)> {
+    let mut child = match media_tool(program) {
+        Ok(mut command) => match command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return Err((format!("Could not launch {label}: {error}"), temp_dir));
+            }
+        },
+        Err(error) => return Err((error, temp_dir)),
     };
-    let mut player_input = player
-        .stdin
-        .take()
-        .ok_or_else(|| "FFplay input stream was unavailable.".to_owned())?;
-    let mut first_chunk = [0; 8192];
-    let count = ffmpeg_output
-        .read(&mut first_chunk)
-        .await
-        .map_err(|error| format!("Could not load preview data: {error}"))?;
-    if count == 0 {
-        let _ = transcoder.wait().await;
-        progress.set(PreviewStage::Failed);
-        return Err("FFmpeg did not produce preview video data.".into());
-    }
-    player_input
-        .write_all(&first_chunk[..count])
-        .await
-        .map_err(|error| format!("Could not send preview data to FFplay: {error}"))?;
-    progress.set(PreviewStage::Playing);
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut ffmpeg_output, &mut player_input).await;
-        drop(player_input);
-        if transcoder.try_wait().ok().flatten().is_none() {
-            let _ = transcoder.kill().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            progress.set(if status.success() {
+                PreviewStage::Finished
+            } else {
+                PreviewStage::Failed
+            });
+            if !status.success() {
+                return Err((failure.to_owned(), temp_dir));
+            }
+            schedule_preview_window_style();
+            // Keep the file until the short-lived player process is fully gone.
+            drop(temp_dir);
+            Ok(player)
         }
-        let _ = transcoder.wait().await;
-        let _ = player.wait().await;
-        progress.set(PreviewStage::Finished);
-    });
-    Ok(PreviewPlayer::Ffplay)
+        Ok(None) => {
+            progress.set(PreviewStage::Playing);
+            schedule_preview_window_style();
+            tokio::spawn(async move {
+                let status = child.wait().await;
+                progress.set(if status.is_ok_and(|status| status.success()) {
+                    PreviewStage::Finished
+                } else {
+                    PreviewStage::Failed
+                });
+                drop(temp_dir);
+            });
+            Ok(player)
+        }
+        Err(error) => Err((
+            format!("Could not check {label} startup: {error}"),
+            temp_dir,
+        )),
+    }
 }
 async fn fetch_thumbnail(url: String) -> Result<Vec<u8>, String> {
     let parsed = Url::parse(&url).map_err(|error| error.to_string())?;
@@ -4120,23 +4662,28 @@ mod tests {
     }
 
     #[test]
-    fn preview_playback_keeps_the_source_timing() {
-        let direct = ffplay_preview_args("https://example.test/video", 10, 25);
-        assert!(direct.windows(2).any(|pair| pair == ["-ss", "00:00:10"]));
-        assert!(direct.windows(2).any(|pair| pair == ["-t", "15"]));
-        let input = direct.iter().position(|arg| arg == "-i").unwrap();
-        let seek = direct.iter().position(|arg| arg == "-ss").unwrap();
-        assert!(seek < input);
-        assert!(!direct.iter().any(|arg| arg == "copy"));
-
-        let merged = synced_preview_args("https://example.test/v", "https://example.test/a", 0, 5);
-        assert!(merged.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+    fn preview_downloads_only_the_selected_section() {
+        let args = build_preview_download_args("https://youtu.be/a", 10, 25, "preview.%(ext)s");
         assert!(
-            merged
-                .windows(2)
-                .any(|pair| pair == ["-fps_mode", "passthrough"])
+            args.windows(2)
+                .any(|w| w == ["--download-sections", "*00:00:10-00:00:25"])
         );
-        assert!(!merged.windows(2).any(|pair| pair == ["-c", "copy"]));
+        assert!(!args.iter().any(|arg| arg == "--force-keyframes-at-cuts"));
+        assert_eq!(args.last().map(String::as_str), Some("https://youtu.be/a"));
+
+        let vlc = vlc_local_preview_args("/tmp/preview.mp4");
+        assert!(vlc.iter().any(|arg| arg == "--play-and-exit"));
+        assert!(!vlc.iter().any(|arg| arg.starts_with("--start-time=")));
+        assert!(!vlc.iter().any(|arg| arg.starts_with("--stop-time=")));
+        assert_eq!(vlc.last().map(String::as_str), Some("/tmp/preview.mp4"));
+
+        let ffplay = ffplay_local_preview_args("/tmp/preview.mp4");
+        assert!(!ffplay.iter().any(|arg| arg == "-ss"));
+        assert!(
+            ffplay
+                .windows(2)
+                .any(|pair| pair == ["-i", "/tmp/preview.mp4"])
+        );
     }
 
     #[test]
@@ -4181,26 +4728,15 @@ Sink Input #18
     }
 
     #[test]
-    fn vlc_preview_opens_the_interval_with_its_own_volume_bar() {
-        let args = vlc_preview_args("https://example.test/video", 10, 25);
+    fn vlc_preview_plays_a_local_clip_with_qt_controls() {
+        let args = vlc_local_preview_args("C:/temp/preview.mp4");
         assert!(args.iter().any(|arg| arg == "--intf=qt"));
         assert!(args.iter().any(|arg| arg == "--play-and-exit"));
-        assert!(args.iter().any(|arg| arg == "--start-time=10"));
-        assert!(args.iter().any(|arg| arg == "--stop-time=25"));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("https://example.test/video")
-        );
-        let slave = vlc_slave_args("https://example.test/v", "https://example.test/a", 0, 5);
-        assert!(
-            slave
-                .iter()
-                .any(|arg| arg == "--input-slave=https://example.test/a")
-        );
-        assert_eq!(
-            slave.last().map(String::as_str),
-            Some("https://example.test/v")
-        );
+        assert!(args.iter().any(|arg| arg.starts_with("--meta-title=")));
+        assert_eq!(args.last().map(String::as_str), Some("C:/temp/preview.mp4"));
+        let mpv = mpv_local_preview_args("C:/temp/preview.mp4");
+        assert!(mpv.iter().any(|arg| arg == "--force-window=yes"));
+        assert_eq!(mpv.last().map(String::as_str), Some("C:/temp/preview.mp4"));
     }
 
     #[test]
@@ -4239,13 +4775,78 @@ Sink Input #18
     }
 
     #[test]
-    fn finds_an_executable_placed_in_a_tools_directory() {
+    fn finds_an_executable_next_to_the_app() {
         let dir = tempfile::tempdir().unwrap();
         let file_name = executable_names("yt-dlp").remove(0);
         std::fs::write(dir.path().join(&file_name), b"tool").unwrap();
         let found = find_named_tool(&[dir.path().to_path_buf()], "yt-dlp").unwrap();
         assert_eq!(found, dir.path().join(file_name));
         assert!(find_named_tool(&[dir.path().to_path_buf()], "ffmpeg").is_none());
+    }
+
+    #[test]
+    fn install_commands_are_ready_to_paste() {
+        let commands = install_commands_text(Language::English);
+        assert!(commands.contains("yt-dlp.yt-dlp") || commands.contains("yt-dlp"));
+        assert!(
+            commands.contains("ffmpeg")
+                || commands.contains("FFmpeg")
+                || commands.contains("Gyan.FFmpeg")
+        );
+        let missing = Toolchain {
+            ytdlp: None,
+            ffmpeg: None,
+            deno: None,
+            vlc: None,
+            mpv: None,
+        };
+        assert_eq!(
+            missing.packages_to_install(),
+            [
+                WingetPackage::YtDlp,
+                WingetPackage::Ffmpeg,
+                WingetPackage::Deno,
+                WingetPackage::Vlc
+            ]
+        );
+        assert!(winget_result_is_ok(0));
+        assert!(winget_result_is_ok(0x8A15_002B));
+        assert!(winget_result_is_ok(0x8A15_0061));
+        assert!(!winget_result_is_ok(0x8A15_0010));
+        let progress = InstallProgress::new(3);
+        progress.set_package(2, "Deno", Language::Portuguese);
+        let summary = progress.summary(Language::Portuguese);
+        assert!(summary.contains("Deno"));
+        assert!(summary.contains("2/3"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_tools_nested_under_winget_style_package_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("Gyan.FFmpeg_Microsoft.Winget.Source_test");
+        let bin = package.join("ffmpeg-9.0.2-full_build").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("ffmpeg.exe"), b"ffmpeg").unwrap();
+        let ytdlp_pkg = root
+            .path()
+            .join("yt-dlp.yt-dlp_Microsoft.Winget.Source_test");
+        std::fs::create_dir_all(&ytdlp_pkg).unwrap();
+        std::fs::write(ytdlp_pkg.join("yt-dlp.exe"), b"ytdlp").unwrap();
+
+        let mut dirs = Vec::new();
+        push_unique_dir(&mut dirs, ytdlp_pkg.clone());
+        collect_winget_bin_dirs(&package, &mut dirs, 0);
+        assert!(
+            find_named_tool(&dirs, "yt-dlp")
+                .unwrap()
+                .ends_with("yt-dlp.exe")
+        );
+        assert!(
+            find_named_tool(&dirs, "ffmpeg")
+                .unwrap()
+                .ends_with("ffmpeg.exe")
+        );
     }
 
     #[test]
