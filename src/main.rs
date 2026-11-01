@@ -86,6 +86,7 @@ fn clipforge_theme() -> Theme {
 fn window_settings() -> iced::window::Settings {
     iced::window::Settings {
         size: iced::Size::new(1200.0, 820.0),
+        position: iced::window::Position::Centered,
         icon: app_icon(),
         platform_specific: desktop_platform(),
         ..Default::default()
@@ -239,6 +240,7 @@ fn refresh_desktop_cache(data_home: &std::path::Path) {
 #[derive(Default)]
 struct App {
     url: String,
+    pending_url_start: Option<u64>,
     notice: Option<String>,
     video: Option<VideoInfo>,
     start: String,
@@ -361,17 +363,19 @@ impl PreviewStage {
 
     fn label(self, language: Language) -> &'static str {
         match (self, language) {
-            (Self::Resolving, Language::Portuguese) => "Preparando a pré-visualização. Aguarde…",
+            (Self::Resolving, Language::Portuguese) => {
+                "Resolvendo o endereço do trecho. Sem baixar o vídeo…"
+            }
             (Self::Buffering, Language::Portuguese) => {
-                "Carregando o trecho. A janela do vídeo abre em seguida…"
+                "Abrindo o reprodutor no intervalo selecionado…"
             }
             (Self::Playing, Language::Portuguese) => "Pré-visualização em reprodução",
             (Self::Finished, Language::Portuguese) => "Pré-visualização encerrada",
             (Self::Failed, Language::Portuguese) => "Não foi possível iniciar a pré-visualização",
-            (Self::Resolving, Language::English) => "Preparing the preview. Please wait…",
-            (Self::Buffering, Language::English) => {
-                "Loading the clip. The video window opens next…"
+            (Self::Resolving, Language::English) => {
+                "Resolving the clip stream. Not downloading the video…"
             }
+            (Self::Buffering, Language::English) => "Opening the player at the selected range…",
             (Self::Playing, Language::English) => "Preview playing",
             (Self::Finished, Language::English) => "Preview finished",
             (Self::Failed, Language::English) => "Could not start preview",
@@ -420,6 +424,7 @@ impl InstallProgress {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn set_package(&self, index: u8, package: &str, language: Language) {
         self.current.store(index, Ordering::Relaxed);
         if let Ok(mut label) = self.label.lock() {
@@ -547,7 +552,23 @@ enum Page {
 impl App {
     fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
-            Message::UrlChanged(value) => self.url = value,
+            Message::UrlChanged(value) => {
+                if let Some(parsed) = parse_pasted_video_url(&value) {
+                    self.url = parsed.canonical_url;
+                    self.pending_url_start = parsed.start_seconds;
+                    if let (Some(seconds), Some(video)) =
+                        (self.pending_url_start, self.video.as_ref())
+                    {
+                        let start = seconds.min(video.duration.saturating_sub(1));
+                        self.start = format_time(start);
+                        if parse_time(&self.end).is_none_or(|end| end <= start) {
+                            self.end = format_time(video.duration);
+                        }
+                    }
+                } else {
+                    self.url = value;
+                }
+            }
             Message::StartChanged(value) => self.start = value,
             Message::EndChanged(value) => self.end = value,
             Message::TimelineStart(seconds) => {
@@ -646,8 +667,12 @@ impl App {
                 if self.toolchain.ytdlp.is_none() {
                     self.notice = export_blocker(&self.toolchain, self.language);
                 } else {
-                    match validate_video_url(&self.url) {
-                        Ok(url) => {
+                    match parse_pasted_video_url(&self.url).ok_or(AppError::InvalidUrl) {
+                        Ok(parsed) => {
+                            self.url = parsed.canonical_url.clone();
+                            self.pending_url_start =
+                                parsed.start_seconds.or(self.pending_url_start);
+                            let url = parsed.canonical_url;
                             self.loading = true;
                             self.notice = Some(
                                 if self.language == Language::Portuguese {
@@ -671,7 +696,12 @@ impl App {
                     Ok(video) => {
                         self.progress = None;
                         self.preview_progress = None;
-                        self.start = "00:00:00".into();
+                        let start_from_url = self
+                            .pending_url_start
+                            .take()
+                            .map(|seconds| seconds.min(video.duration.saturating_sub(1)))
+                            .unwrap_or(0);
+                        self.start = format_time(start_from_url);
                         self.selected_format = None;
                         self.end = format_time(video.duration);
                         if self.destination.is_empty() {
@@ -679,14 +709,23 @@ impl App {
                                 .to_string_lossy()
                                 .into_owned();
                         }
-                        self.notice = Some(
+                        self.notice = Some(if start_from_url > 0 {
                             if self.language == Language::Portuguese {
-                                "Metadados carregados. Selecione um trecho e exporte."
+                                format!(
+                                    "Metadados carregados. Início do trecho definido em {} a partir do link.",
+                                    format_time(start_from_url)
+                                )
                             } else {
-                                "Metadata loaded. Select a clip range and export."
+                                format!(
+                                    "Metadata loaded. Clip start set to {} from the link.",
+                                    format_time(start_from_url)
+                                )
                             }
-                            .into(),
-                        );
+                        } else if self.language == Language::Portuguese {
+                            "Metadados carregados. Selecione um trecho e exporte.".into()
+                        } else {
+                            "Metadata loaded. Select a clip range and export.".into()
+                        });
                         self.thumbnail = None;
                         self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
                         let generation = self.thumbnail_generation;
@@ -822,9 +861,9 @@ impl App {
                             self.preview_player = None;
                             self.notice = Some(
                                 if self.language == Language::Portuguese {
-                                    "Aguarde. Baixando só o trecho selecionado para a pré-visualização…"
+                                    "Abrindo a pré-visualização do trecho selecionado…"
                                 } else {
-                                    "Please wait. Downloading only the selected range for preview…"
+                                    "Opening preview of the selected range…"
                                 }
                                 .into(),
                             );
@@ -2332,6 +2371,7 @@ enum WingetPackage {
 }
 
 impl WingetPackage {
+    #[cfg(windows)]
     fn label(self) -> &'static str {
         match self {
             Self::YtDlp => "yt-dlp",
@@ -2341,6 +2381,7 @@ impl WingetPackage {
         }
     }
 
+    #[cfg(windows)]
     fn id(self) -> &'static str {
         match self {
             Self::YtDlp => "yt-dlp.yt-dlp",
@@ -2720,10 +2761,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
 fn winget_code(status: &std::process::ExitStatus) -> u32 {
     status.code().map(|code| code as u32).unwrap_or(u32::MAX)
 }
 
+#[cfg(any(windows, test))]
 fn winget_result_is_ok(code: u32) -> bool {
     matches!(
         code,
@@ -2736,6 +2779,7 @@ fn winget_result_is_ok(code: u32) -> bool {
     )
 }
 
+#[cfg(windows)]
 fn winget_code_message(code: u32, package: &str, language: Language) -> String {
     match (code, language) {
         (0x8A15_002B, Language::Portuguese) => format!(
@@ -3248,22 +3292,220 @@ fn preview_player_line(line: &str) -> bool {
     lower.contains("ffplay") || lower.contains("mpv") || lower.contains("clipforge")
 }
 
-fn validate_video_url(input: &str) -> Result<String, AppError> {
-    let url = Url::parse(input.trim()).map_err(|_| AppError::InvalidUrl)?;
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-    let supported = matches!(
-        host.as_str(),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PastedVideoUrl {
+    canonical_url: String,
+    start_seconds: Option<u64>,
+}
+
+fn parse_pasted_video_url(input: &str) -> Option<PastedVideoUrl> {
+    let candidate = extract_youtube_url_candidate(input)?;
+    let mut url = Url::parse(&candidate).ok()?;
+    if url.scheme() == "http" {
+        url.set_scheme("https").ok()?;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !is_supported_youtube_host(&host) || url.path() == "/" {
+        return None;
+    }
+
+    let mut start_seconds = None;
+    let mut kept_pairs = Vec::new();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "t" | "start" | "time_continue" => {
+                if start_seconds.is_none() {
+                    start_seconds = parse_youtube_timestamp(value.as_ref());
+                }
+            }
+            "v" | "list" | "index" => kept_pairs.push((key.into_owned(), value.into_owned())),
+            _ => {}
+        }
+    }
+    if let Some(fragment) = url.fragment() {
+        let stamp = fragment
+            .strip_prefix("t=")
+            .or_else(|| fragment.strip_prefix("start="))
+            .unwrap_or(fragment);
+        if start_seconds.is_none() {
+            start_seconds = parse_youtube_timestamp(stamp);
+        }
+    }
+
+    // Rebuild the query with only the video identity. Prefer an explicit
+    // watch?v= form so later validation never depends on leftover share params.
+    if host == "youtu.be" || host == "www.youtu.be" {
+        let id = url
+            .path_segments()
+            .and_then(|mut parts| parts.next())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if let Some(id) = id {
+            let mut watch = Url::parse(&format!("https://www.youtube.com/watch?v={id}")).ok()?;
+            if let Some(list) = kept_pairs
+                .iter()
+                .find(|(key, _)| key == "list")
+                .map(|(_, value)| value.clone())
+            {
+                watch.query_pairs_mut().append_pair("list", &list);
+            }
+            return Some(PastedVideoUrl {
+                canonical_url: watch.to_string(),
+                start_seconds,
+            });
+        }
+    }
+
+    {
+        let mut query = url.query_pairs_mut();
+        query.clear();
+        for (key, value) in &kept_pairs {
+            query.append_pair(key, value);
+        }
+    }
+    if url.query().is_some_and(str::is_empty) {
+        url.set_query(None);
+    }
+    url.set_fragment(None);
+
+    if kept_pairs.iter().all(|(key, _)| key != "v") && url.path() == "/watch" {
+        return None;
+    }
+
+    Some(PastedVideoUrl {
+        canonical_url: url.to_string(),
+        start_seconds,
+    })
+}
+
+fn is_supported_youtube_host(host: &str) -> bool {
+    matches!(
+        host,
         "youtube.com"
             | "www.youtube.com"
             | "m.youtube.com"
             | "youtu.be"
+            | "www.youtu.be"
             | "www.youtube-nocookie.com"
             | "youtube-nocookie.com"
-    );
-    if url.scheme() != "https" || !supported || (host.contains("youtu") && url.path() == "/") {
-        return Err(AppError::InvalidUrl);
+    )
+}
+
+fn extract_youtube_url_candidate(input: &str) -> Option<String> {
+    let trimmed = sanitize_pasted_url_text(input);
+    if trimmed.is_empty() {
+        return None;
     }
-    Ok(url.to_string())
+    if let Ok(url) = Url::parse(&trimmed)
+        && url.has_host()
+    {
+        return Some(trimmed);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let start = lower
+        .find("https://")
+        .or_else(|| lower.find("http://"))
+        .or_else(|| lower.find("www.youtube.com/"))
+        .or_else(|| lower.find("youtube.com/"))
+        .or_else(|| lower.find("youtu.be/"))?;
+    let rest = &trimmed[start..];
+    let end = rest
+        .find(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '<' | '>' | '"' | '\'' | ')' | ']' | '“' | '”' | '‘' | '’' | '«' | '»'
+                )
+        })
+        .unwrap_or(rest.len());
+    let mut candidate = rest[..end]
+        .trim_end_matches(['.', ',', ';', '!', '?', '…'])
+        .replace("&amp;", "&")
+        .replace('＆', "&");
+    if candidate.starts_with("http://") {
+        candidate = format!("https://{}", &candidate["http://".len()..]);
+    } else if !candidate.starts_with("https://") {
+        candidate = format!("https://{candidate}");
+    }
+    Some(candidate)
+}
+
+fn sanitize_pasted_url_text(input: &str) -> String {
+    let trimmed = input.trim().trim_matches(|c: char| {
+        matches!(
+            c,
+            '\u{feff}'
+                | '\u{200b}'
+                | '\u{200c}'
+                | '\u{200d}'
+                | '\u{2060}'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '«'
+                | '»'
+                | '"'
+                | '\''
+        )
+    });
+    trimmed
+        .replace('\u{00a0}', " ")
+        .replace("&amp;", "&")
+        .replace('＆', "&")
+        .trim()
+        .to_owned()
+}
+
+fn parse_youtube_timestamp(raw: &str) -> Option<u64> {
+    let value = raw.trim().trim_end_matches(|c: char| {
+        // Tolerate trailing punctuation copied with the stamp.
+        matches!(c, '.' | ',' | ';' | '!' | '?' | '…')
+    });
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        return value.parse().ok();
+    }
+    let mut total = 0u64;
+    let mut number = 0u64;
+    let mut seen_digit = false;
+    let mut seen_unit = false;
+    for character in value.chars() {
+        match character {
+            '0'..='9' => {
+                number = number
+                    .checked_mul(10)?
+                    .checked_add(u64::from(character.to_digit(10)?))?;
+                seen_digit = true;
+            }
+            'h' | 'H' => {
+                total = total.checked_add(number.checked_mul(3600)?)?;
+                number = 0;
+                seen_unit = true;
+            }
+            'm' | 'M' => {
+                total = total.checked_add(number.checked_mul(60)?)?;
+                number = 0;
+                seen_unit = true;
+            }
+            's' | 'S' => {
+                total = total.checked_add(number)?;
+                number = 0;
+                seen_unit = true;
+            }
+            _ => return None,
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    if seen_unit {
+        total.checked_add(number)
+    } else {
+        Some(number)
+    }
 }
 fn parse_time(input: &str) -> Option<u64> {
     let mut parts = input.trim().split(':');
@@ -3674,65 +3916,196 @@ async fn launch_preview(
     if !command_exists("vlc") && !command_exists("mpv") && !command_exists("ffplay") {
         return Err("Install VLC, MPV, or FFplay to preview the selected interval.".into());
     }
-    // Download only the selected interval so the player never opens the full source.
-    let (mut temp_dir, clip) = download_preview_section(&url, start, end, progress.clone()).await?;
-    let path = clip.to_string_lossy().into_owned();
+    progress.set(PreviewStage::Resolving);
+    // Resolve direct media URLs only — never download the section for preview.
+    // The player opens immediately and seeks into the selected range itself.
+    let streams = preview_stream_urls(&url).await?;
+    progress.set(PreviewStage::Buffering);
+    spawn_direct_section_preview(&streams, start, end, progress).await
+}
+
+fn preview_stream_urls_args(url: &str) -> Vec<String> {
+    vec![
+        "--ignore-config".into(),
+        "--no-warnings".into(),
+        "--no-playlist".into(),
+        "--get-url".into(),
+        // Prefer a single progressive/muxed URL so the player can seek natively.
+        "-f".into(),
+        "b/bv*+ba/b".into(),
+        "--".into(),
+        url.into(),
+    ]
+}
+
+async fn preview_stream_urls(url: &str) -> Result<Vec<String>, String> {
+    let output = media_tool("yt-dlp")?
+        .args(preview_stream_urls_args(url))
+        .output()
+        .await
+        .map_err(|error| format!("Could not resolve video stream for preview: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            format!(
+                "yt-dlp failed to resolve a preview stream ({}).",
+                output.status
+            )
+        } else {
+            format!("yt-dlp could not resolve a preview stream: {detail}")
+        });
+    }
+    let streams: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .map(str::to_owned)
+        .collect();
+    if streams.is_empty() || streams.len() > 2 {
+        return Err("yt-dlp returned an unsupported number of preview streams.".into());
+    }
+    Ok(streams)
+}
+
+fn vlc_direct_preview_args(streams: &[String], start: u64, end: u64) -> Option<Vec<String>> {
+    let [stream] = streams else {
+        return None;
+    };
+    // Do not use --play-and-exit: seeking on network streams briefly looks like
+    // EOF and VLC would close the window. Keep --stop-time so playback still
+    // ends at the selected range; the window stays open for scrubbing.
+    Some(vec![
+        "--ignore-config".into(),
+        "--intf=qt".into(),
+        "--no-one-instance".into(),
+        "--no-one-instance-when-started-from-file".into(),
+        "--no-video-title-show".into(),
+        "--no-qt-privacy-ask".into(),
+        "--no-qt-system-tray".into(),
+        "--qt-notification=0".into(),
+        "--qt-continue=0".into(),
+        "--no-loop".into(),
+        format!("--meta-title={PREVIEW_WINDOW_TITLE}"),
+        format!("--start-time={start}"),
+        format!("--stop-time={end}"),
+        "--".into(),
+        stream.clone(),
+    ])
+}
+
+fn mpv_direct_preview_args(streams: &[String], start: u64, end: u64) -> Option<Vec<String>> {
+    let mut args = vec![
+        "--force-window=yes".into(),
+        "--osc=yes".into(),
+        "--script-opts=osc-visibility=always".into(),
+        "--keep-open=yes".into(),
+        "--speed=1".into(),
+        format!("--title={PREVIEW_WINDOW_TITLE}"),
+        format!("--start={start}"),
+        format!("--end={end}"),
+    ];
+    match streams {
+        [stream] => {
+            args.push("--".into());
+            args.push(stream.clone());
+            Some(args)
+        }
+        [video, audio] => {
+            args.push(format!("--audio-file={audio}"));
+            args.push("--".into());
+            args.push(video.clone());
+            Some(args)
+        }
+        _ => None,
+    }
+}
+
+fn ffplay_direct_preview_args(streams: &[String], start: u64, end: u64) -> Option<Vec<String>> {
+    let [stream] = streams else {
+        return None;
+    };
+    let duration = end.saturating_sub(start).to_string();
+    Some(vec![
+        "-hide_banner".into(),
+        "-autoexit".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-window_title".into(),
+        PREVIEW_WINDOW_TITLE.into(),
+        "-ss".into(),
+        start.to_string(),
+        "-t".into(),
+        duration,
+        "-i".into(),
+        stream.clone(),
+    ])
+}
+
+async fn spawn_direct_section_preview(
+    streams: &[String],
+    start: u64,
+    end: u64,
+    progress: Arc<PreviewProgress>,
+) -> Result<PreviewPlayer, String> {
+    if streams.is_empty() || streams.len() > 2 {
+        return Err("yt-dlp returned an unsupported number of preview streams.".into());
+    }
+
     let mut last_error = None;
 
-    if command_exists("vlc") {
-        match spawn_local_preview_player(
+    if command_exists("vlc")
+        && let Some(args) = vlc_direct_preview_args(streams, start, end)
+    {
+        match spawn_preview_player_process(
             "vlc",
-            &vlc_local_preview_args(&path),
+            &args,
             progress.clone(),
             PreviewPlayer::Vlc,
             "VLC",
             "VLC could not open the preview.",
-            temp_dir,
         )
         .await
         {
             Ok(player) => return Ok(player),
-            Err((error, returned_dir)) => {
-                log::warn!("VLC preview failed: {error}");
+            Err(error) => {
+                log::warn!("VLC direct preview failed: {error}");
                 last_error = Some(error);
-                temp_dir = returned_dir;
             }
         }
     }
 
-    if command_exists("mpv") {
-        match spawn_local_preview_player(
+    if command_exists("mpv")
+        && let Some(args) = mpv_direct_preview_args(streams, start, end)
+    {
+        match spawn_preview_player_process(
             "mpv",
-            &mpv_local_preview_args(&path),
+            &args,
             progress.clone(),
             PreviewPlayer::Mpv,
             "MPV",
             "MPV could not open the preview.",
-            temp_dir,
         )
         .await
         {
             Ok(player) => return Ok(player),
-            Err((error, returned_dir)) => {
-                log::warn!("MPV preview failed: {error}");
+            Err(error) => {
+                log::warn!("MPV direct preview failed: {error}");
                 last_error = Some(error);
-                temp_dir = returned_dir;
             }
         }
     }
 
-    if command_exists("ffplay") {
-        return spawn_local_preview_player(
+    if command_exists("ffplay")
+        && let Some(args) = ffplay_direct_preview_args(streams, start, end)
+    {
+        return spawn_preview_player_process(
             "ffplay",
-            &ffplay_local_preview_args(&path),
+            &args,
             progress,
             PreviewPlayer::Ffplay,
             "FFplay",
             "FFplay could not open the preview.",
-            temp_dir,
         )
-        .await
-        .map_err(|(error, _)| error);
+        .await;
     }
 
     progress.set(PreviewStage::Failed);
@@ -3740,151 +4113,27 @@ async fn launch_preview(
         .unwrap_or_else(|| "Install VLC, MPV, or FFplay to preview the selected interval.".into()))
 }
 
-fn build_preview_download_args(url: &str, start: u64, end: u64, template: &str) -> Vec<String> {
-    vec![
-        "--newline".into(),
-        "--ignore-config".into(),
-        "--no-warnings".into(),
-        "--no-playlist".into(),
-        "--download-sections".into(),
-        format!("*{}-{}", format_time(start), format_time(end)),
-        "-f".into(),
-        "bv*[height<=1080]+ba/b".into(),
-        "--merge-output-format".into(),
-        "mp4".into(),
-        "-o".into(),
-        template.into(),
-        url.into(),
-    ]
-}
-
-async fn download_preview_section(
-    url: &str,
-    start: u64,
-    end: u64,
-    progress: Arc<PreviewProgress>,
-) -> Result<(tempfile::TempDir, PathBuf), String> {
-    progress.set(PreviewStage::Resolving);
-    let temp_dir = tempfile::Builder::new()
-        .prefix("clipforge-preview-")
-        .tempdir()
-        .map_err(|error| format!("Could not create a preview temp folder: {error}"))?;
-    let template = temp_dir.path().join("preview.%(ext)s");
-    let template = template.to_string_lossy().into_owned();
-    let args = build_preview_download_args(url, start, end, &template);
-    progress.set(PreviewStage::Buffering);
-    let output = media_tool("yt-dlp")?
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|error| format!("Could not download the preview section: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if detail.is_empty() {
-            format!(
-                "yt-dlp failed to download the preview section ({}).",
-                output.status
-            )
-        } else {
-            format!("yt-dlp could not download the preview section: {detail}")
-        });
-    }
-    let mut entries = tokio::fs::read_dir(temp_dir.path())
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut clip = None;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        let path = entry.path();
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mkv" | "webm"))
-        {
-            clip = Some(path);
-            break;
-        }
-    }
-    let clip =
-        clip.ok_or_else(|| "yt-dlp completed without producing a preview media file.".to_owned())?;
-    Ok((temp_dir, clip))
-}
-
-fn vlc_local_preview_args(path: &str) -> Vec<String> {
-    vec![
-        "--ignore-config".into(),
-        "--intf=qt".into(),
-        "--no-one-instance".into(),
-        "--no-one-instance-when-started-from-file".into(),
-        "--play-and-exit".into(),
-        "--no-video-title-show".into(),
-        "--no-qt-privacy-ask".into(),
-        "--no-qt-system-tray".into(),
-        "--qt-notification=0".into(),
-        "--qt-continue=0".into(),
-        format!("--meta-title={PREVIEW_WINDOW_TITLE}"),
-        "--".into(),
-        path.into(),
-    ]
-}
-
-fn mpv_local_preview_args(path: &str) -> Vec<String> {
-    vec![
-        "--force-window=yes".into(),
-        "--osc=yes".into(),
-        "--script-opts=osc-visibility=always".into(),
-        "--speed=1".into(),
-        format!("--title={PREVIEW_WINDOW_TITLE}"),
-        "--".into(),
-        path.into(),
-    ]
-}
-
-fn ffplay_local_preview_args(path: &str) -> Vec<String> {
-    vec![
-        "-hide_banner".into(),
-        "-autoexit".into(),
-        "-loglevel".into(),
-        "error".into(),
-        "-window_title".into(),
-        PREVIEW_WINDOW_TITLE.into(),
-        "-i".into(),
-        path.into(),
-    ]
-}
-
-async fn spawn_local_preview_player(
+async fn spawn_preview_player_process(
     program: &str,
     args: &[String],
     progress: Arc<PreviewProgress>,
     player: PreviewPlayer,
     label: &str,
     failure: &'static str,
-    temp_dir: tempfile::TempDir,
-) -> Result<PreviewPlayer, (String, tempfile::TempDir)> {
-    let mut child = match media_tool(program) {
-        Ok(mut command) => match command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                return Err((format!("Could not launch {label}: {error}"), temp_dir));
-            }
-        },
-        Err(error) => return Err((error, temp_dir)),
-    };
-    tokio::time::sleep(Duration::from_millis(400)).await;
+) -> Result<PreviewPlayer, String> {
+    let mut child = media_tool(program)?
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(|error| format!("Could not launch {label}: {error}"))?;
+    // Mark playing immediately so the UI does not wait on deep seeks or export
+    // bandwidth. The player window appears while it seeks into the range.
+    progress.set(PreviewStage::Playing);
+    schedule_preview_window_style();
+    tokio::time::sleep(Duration::from_millis(350)).await;
     match child.try_wait() {
         Ok(Some(status)) => {
             progress.set(if status.success() {
@@ -3892,17 +4141,13 @@ async fn spawn_local_preview_player(
             } else {
                 PreviewStage::Failed
             });
-            if !status.success() {
-                return Err((failure.to_owned(), temp_dir));
+            if status.success() {
+                Ok(player)
+            } else {
+                Err(failure.to_owned())
             }
-            schedule_preview_window_style();
-            // Keep the file until the short-lived player process is fully gone.
-            drop(temp_dir);
-            Ok(player)
         }
         Ok(None) => {
-            progress.set(PreviewStage::Playing);
-            schedule_preview_window_style();
             tokio::spawn(async move {
                 let status = child.wait().await;
                 progress.set(if status.is_ok_and(|status| status.success()) {
@@ -3910,14 +4155,13 @@ async fn spawn_local_preview_player(
                 } else {
                     PreviewStage::Failed
                 });
-                drop(temp_dir);
             });
             Ok(player)
         }
-        Err(error) => Err((
-            format!("Could not check {label} startup: {error}"),
-            temp_dir,
-        )),
+        Err(error) => {
+            progress.set(PreviewStage::Failed);
+            Err(format!("Could not check {label} startup: {error}"))
+        }
     }
 }
 async fn fetch_thumbnail(url: String) -> Result<Vec<u8>, String> {
@@ -4487,10 +4731,70 @@ mod tests {
     use super::*;
     #[test]
     fn accepts_youtube_video_and_short_urls() {
-        assert!(validate_video_url("https://www.youtube.com/watch?v=abc").is_ok());
-        assert!(validate_video_url("https://youtu.be/abc").is_ok());
-        assert!(validate_video_url("https://example.com/watch?v=abc").is_err());
-        assert!(validate_video_url("http://youtube.com/watch?v=abc").is_err());
+        assert!(parse_pasted_video_url("https://www.youtube.com/watch?v=abc").is_some());
+        assert!(parse_pasted_video_url("https://youtu.be/abc").is_some());
+        assert!(parse_pasted_video_url("https://example.com/watch?v=abc").is_none());
+        assert_eq!(
+            parse_pasted_video_url("http://youtube.com/watch?v=abc")
+                .unwrap()
+                .canonical_url,
+            "https://youtube.com/watch?v=abc"
+        );
+    }
+
+    #[test]
+    fn pasted_youtube_urls_keep_the_video_and_timestamp() {
+        let stamped = parse_pasted_video_url(
+            "Assista aqui https://youtu.be/abc123?t=1h11m36s&si=noise agora",
+        )
+        .expect("stamped paste");
+        assert_eq!(
+            stamped.canonical_url,
+            "https://www.youtube.com/watch?v=abc123"
+        );
+        assert_eq!(stamped.start_seconds, Some(4296));
+
+        let watch =
+            parse_pasted_video_url("https://www.youtube.com/watch?v=abc123&t=90s&feature=share")
+                .expect("watch paste");
+        assert_eq!(
+            watch.canonical_url,
+            "https://www.youtube.com/watch?v=abc123"
+        );
+        assert_eq!(watch.start_seconds, Some(90));
+
+        let fragment = parse_pasted_video_url("https://youtu.be/abc123#t=2m5s").expect("fragment");
+        assert_eq!(
+            fragment.canonical_url,
+            "https://www.youtube.com/watch?v=abc123"
+        );
+        assert_eq!(fragment.start_seconds, Some(125));
+
+        assert_eq!(parse_youtube_timestamp("4296"), Some(4296));
+        assert_eq!(parse_youtube_timestamp("1h2m3s"), Some(3723));
+        assert_eq!(parse_youtube_timestamp("10m"), Some(600));
+        assert_eq!(parse_youtube_timestamp("158s"), Some(158));
+        assert!(parse_youtube_timestamp("").is_none());
+
+        let real = parse_pasted_video_url("https://www.youtube.com/watch?v=EWlB5QGCnAU&t=158s")
+            .expect("real stamped watch URL");
+        assert_eq!(
+            real.canonical_url,
+            "https://www.youtube.com/watch?v=EWlB5QGCnAU"
+        );
+        assert_eq!(real.start_seconds, Some(158));
+        assert_eq!(
+            parse_pasted_video_url("https://www.youtube.com/watch?v=EWlB5QGCnAU&t=158s")
+                .unwrap()
+                .canonical_url,
+            "https://www.youtube.com/watch?v=EWlB5QGCnAU"
+        );
+        assert_eq!(
+            parse_pasted_video_url("“https://www.youtube.com/watch?v=EWlB5QGCnAU&t=158s”")
+                .expect("quoted paste")
+                .start_seconds,
+            Some(158)
+        );
     }
     #[test]
     fn language_preference_codes_round_trip_and_default_safely() {
@@ -4662,27 +4966,58 @@ mod tests {
     }
 
     #[test]
-    fn preview_downloads_only_the_selected_section() {
-        let args = build_preview_download_args("https://youtu.be/a", 10, 25, "preview.%(ext)s");
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--download-sections", "*00:00:10-00:00:25"])
-        );
-        assert!(!args.iter().any(|arg| arg == "--force-keyframes-at-cuts"));
+    fn preview_resolves_stream_urls_without_downloading() {
+        let args = preview_stream_urls_args("https://youtu.be/a");
+        assert!(args.iter().any(|arg| arg == "--get-url"));
+        assert!(!args.iter().any(|arg| arg == "--download-sections"));
         assert_eq!(args.last().map(String::as_str), Some("https://youtu.be/a"));
 
-        let vlc = vlc_local_preview_args("/tmp/preview.mp4");
-        assert!(vlc.iter().any(|arg| arg == "--play-and-exit"));
-        assert!(!vlc.iter().any(|arg| arg.starts_with("--start-time=")));
-        assert!(!vlc.iter().any(|arg| arg.starts_with("--stop-time=")));
-        assert_eq!(vlc.last().map(String::as_str), Some("/tmp/preview.mp4"));
+        let streams = vec!["https://cdn.example/video.mp4".into()];
+        let vlc = vlc_direct_preview_args(&streams, 10, 25).expect("single-stream VLC");
+        assert!(!vlc.iter().any(|arg| arg == "--play-and-exit"));
+        assert!(vlc.iter().any(|arg| arg == "--start-time=10"));
+        assert!(vlc.iter().any(|arg| arg == "--stop-time=25"));
+        assert_eq!(
+            vlc.last().map(String::as_str),
+            Some("https://cdn.example/video.mp4")
+        );
+        assert!(
+            vlc_direct_preview_args(
+                &[
+                    "https://cdn.example/video.mp4".into(),
+                    "https://cdn.example/audio.m4a".into()
+                ],
+                10,
+                25
+            )
+            .is_none()
+        );
 
-        let ffplay = ffplay_local_preview_args("/tmp/preview.mp4");
-        assert!(!ffplay.iter().any(|arg| arg == "-ss"));
+        let mpv = mpv_direct_preview_args(&streams, 10, 25).expect("single-stream MPV");
+        assert!(mpv.iter().any(|arg| arg == "--start=10"));
+        assert!(mpv.iter().any(|arg| arg == "--end=25"));
+
+        let dual = mpv_direct_preview_args(
+            &[
+                "https://cdn.example/video.mp4".into(),
+                "https://cdn.example/audio.m4a".into(),
+            ],
+            10,
+            25,
+        )
+        .expect("dual-stream MPV");
+        assert!(
+            dual.iter()
+                .any(|arg| arg == "--audio-file=https://cdn.example/audio.m4a")
+        );
+
+        let ffplay = ffplay_direct_preview_args(&streams, 10, 25).expect("single-stream FFplay");
+        assert!(ffplay.windows(2).any(|pair| pair == ["-ss", "10"]));
+        assert!(ffplay.windows(2).any(|pair| pair == ["-t", "15"]));
         assert!(
             ffplay
                 .windows(2)
-                .any(|pair| pair == ["-i", "/tmp/preview.mp4"])
+                .any(|pair| pair == ["-i", "https://cdn.example/video.mp4"])
         );
     }
 
@@ -4728,15 +5063,21 @@ Sink Input #18
     }
 
     #[test]
-    fn vlc_preview_plays_a_local_clip_with_qt_controls() {
-        let args = vlc_local_preview_args("C:/temp/preview.mp4");
+    fn vlc_preview_uses_qt_controls_for_direct_streams() {
+        let streams = vec!["https://cdn.example/video.mp4".into()];
+        let args = vlc_direct_preview_args(&streams, 60, 90).expect("VLC args");
         assert!(args.iter().any(|arg| arg == "--intf=qt"));
-        assert!(args.iter().any(|arg| arg == "--play-and-exit"));
+        assert!(!args.iter().any(|arg| arg == "--play-and-exit"));
         assert!(args.iter().any(|arg| arg.starts_with("--meta-title=")));
-        assert_eq!(args.last().map(String::as_str), Some("C:/temp/preview.mp4"));
-        let mpv = mpv_local_preview_args("C:/temp/preview.mp4");
+        assert!(args.iter().any(|arg| arg == "--start-time=60"));
+        assert!(args.iter().any(|arg| arg == "--stop-time=90"));
+        let mpv = mpv_direct_preview_args(&streams, 60, 90).expect("MPV args");
         assert!(mpv.iter().any(|arg| arg == "--force-window=yes"));
-        assert_eq!(mpv.last().map(String::as_str), Some("C:/temp/preview.mp4"));
+        assert!(mpv.iter().any(|arg| arg == "--keep-open=yes"));
+        assert_eq!(
+            mpv.last().map(String::as_str),
+            Some("https://cdn.example/video.mp4")
+        );
     }
 
     #[test]
