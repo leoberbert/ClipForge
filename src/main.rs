@@ -704,10 +704,18 @@ impl App {
                         self.start = format_time(start_from_url);
                         self.selected_format = None;
                         self.end = format_time(video.duration);
-                        if self.destination.is_empty() {
-                            self.destination = default_destination(&video.title)
-                                .to_string_lossy()
-                                .into_owned();
+                        let new_video = self
+                            .video
+                            .as_ref()
+                            .is_none_or(|previous| previous.url != video.url);
+                        if new_video || self.destination.trim().is_empty() {
+                            self.destination = destination_for_video(
+                                &self.destination,
+                                &video.title,
+                                self.output_format,
+                            )
+                            .to_string_lossy()
+                            .into_owned();
                         }
                         self.notice = Some(if start_from_url > 0 {
                             if self.language == Language::Portuguese {
@@ -3546,8 +3554,8 @@ fn safe_file_stem(title: &str) -> String {
     let stem = stem.chars().take(80).collect::<String>();
     if stem.is_empty() { "clip".into() } else { stem }
 }
-fn default_destination(title: &str) -> PathBuf {
-    let filename = format!("{}.mp4", safe_file_stem(title));
+fn default_destination(title: &str, extension: &str) -> PathBuf {
+    let filename = format!("{}.{extension}", safe_file_stem(title));
     if let Some(home) = user_home()
         && home.is_absolute()
     {
@@ -3561,6 +3569,20 @@ fn default_destination(title: &str) -> PathBuf {
 fn default_destination_in(home: &std::path::Path, filename: &str) -> PathBuf {
     home.join("Downloads").join(filename)
 }
+
+/// Output path for a newly loaded video: keeps the folder of the current
+/// destination (or the default Downloads folder) and replaces the filename.
+fn destination_for_video(current: &str, title: &str, format: ExportFormat) -> PathBuf {
+    let extension = format.extension();
+    match std::path::Path::new(current.trim())
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        Some(dir) => dir.join(format!("{}.{extension}", safe_file_stem(title))),
+        None => default_destination(title, extension),
+    }
+}
+
 fn progress_details(line: &str) -> Option<(u8, Option<String>, Option<String>)> {
     let value = line.split_once("CLIP_PROGRESS:")?.1;
     let mut fields = value.split('|');
@@ -5200,5 +5222,52 @@ Sink Input #18
             desktop_exec("/home/user/My Apps/clipforge"),
             "\"/home/user/My Apps/clipforge\""
         );
+    }
+
+    #[test]
+    fn output_name_follows_the_new_video_and_format_but_keeps_the_folder() {
+        assert_eq!(
+            destination_for_video("/home/u/Videos/Old.mp4", "New Title", ExportFormat::Mp3),
+            PathBuf::from("/home/u/Videos/New Title.mp3")
+        );
+    }
+    #[test]
+    fn loading_another_video_replaces_the_output_name() {
+        let mut app = App {
+            destination: "/home/u/Videos/First.mp4".into(),
+            video: Some(test_video("https://youtu.be/first", "First")),
+            ..App::default()
+        };
+        let _ = app.update(Message::Loaded(Ok(test_video(
+            "https://youtu.be/second",
+            "Second",
+        ))));
+        assert_eq!(
+            PathBuf::from(&app.destination),
+            PathBuf::from("/home/u/Videos/Second.mp4")
+        );
+    }
+    #[test]
+    fn reloading_the_same_video_keeps_a_custom_output_name() {
+        let mut app = App {
+            destination: "/home/u/Videos/Custom name.mp4".into(),
+            video: Some(test_video("https://youtu.be/first", "First")),
+            ..App::default()
+        };
+        let _ = app.update(Message::Loaded(Ok(test_video(
+            "https://youtu.be/first",
+            "First",
+        ))));
+        assert_eq!(app.destination, "/home/u/Videos/Custom name.mp4");
+    }
+    fn test_video(url: &str, title: &str) -> VideoInfo {
+        VideoInfo {
+            url: url.into(),
+            title: title.into(),
+            channel: "Channel".into(),
+            thumbnail: None,
+            duration: 60,
+            formats: Vec::new(),
+        }
     }
 }

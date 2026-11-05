@@ -7,6 +7,7 @@
 - Show export preparation, download, processing, finalization, and outcome with live progress details.
 - Polish the create workflow with clearer hierarchy, typography, and button styles.
 - Add fixture-backed metadata and quality-selection tests.
+- Replace the output filename with the new video's title when loading another video, keeping the chosen folder; reloading the same video keeps a custom name.
 
 ## Limitations
 
